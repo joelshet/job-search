@@ -4,7 +4,7 @@ Status: unfilled
 
 Claude: build this from `00-profile.md` with the user, after that file is filled.
 Propose each filter and weight from their answers, and let them correct it. Keep
-the section names: the skills and `CLAUDE.md` refer to "stage 1" and the
+the section names: the skills and `AGENTS.md` refer to "stage 1" and the
 "evidence standard" by name.
 
 ## Stage 1: hard filters (pass/fail)

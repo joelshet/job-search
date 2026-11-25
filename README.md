@@ -18,7 +18,7 @@ Removing `origin` keeps your search out of the template's repository. Your dossi
 claude
 ```
 
-Run it in this folder. `CLAUDE.md` tells Claude to check `brief/` first. Four of the five files there hold questions about what you want, and Claude interviews you and writes your answers in. This is most of the setup, and research is only as good as these files. `brief/04-people.md` is optional.
+Run it in this folder, or start another coding agent there. `AGENTS.md` tells it to check `brief/` first. Four of the five files there hold questions about what you want, and Claude interviews you and writes your answers in. This is most of the setup, and research is only as good as these files. `brief/04-people.md` is optional.
 
 Then fill in `content/materials/resume.md` and `cover-letter.md`, or paste your current resume to Claude and ask it to.
 
@@ -140,7 +140,7 @@ Lists them as TSV: id, kind, areas, goals, where, employer, company dossier, lab
 
 ## Researching more companies
 
-Ask Claude in this folder to run a research round. `CLAUDE.md` tells it the dossier format and the checks to run, and `brief/` tells it what to look for. Press `r` in triage when it finishes.
+Ask Claude in this folder to run a research round. `AGENTS.md` tells it the dossier format and the checks to run, and `brief/` tells it what to look for. Press `r` in triage when it finishes.
 
 ## Every open posting, searchable
 

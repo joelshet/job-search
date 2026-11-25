@@ -81,7 +81,7 @@ own homepage, confirmed by loading and reading it. The page must name the
 company or its product. When you can't find or confirm one, leave it out and
 list the company under "Need a website" in the report so the user can supply
 it. `./jobs check` fails until it's resolved. Then apply the basic screening in
-`CLAUDE.md`, confirming the website with `./jobs shoot` (step 4 below).
+`AGENTS.md`, confirming the website with `./jobs shoot` (step 4 below).
 
     ./jobs add-company "Filament Forge" \
       --set website=https://filamentforge.example --set screen=PASS --set confidence=medium \
