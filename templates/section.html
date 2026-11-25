@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}{{ section.title }}{% endblock %}
+{% block content %}
+{% set parts = section.components %}
+{% set apps = get_section(path="applications/_index.md") %}
+
+{% if section.relative_path == "companies/_index.md" %}
+<h1>Companies</h1>
+{% set list = [get_section(path=path) for path in section.subsections] %}
+<table>
+<thead><tr><th>Company</th><th>Tier</th><th>Score</th><th>Roles</th><th>Location</th></tr></thead>
+<tbody>
+{% for c in list | sort(attribute="extra.score") | reverse %}
+<tr>
+  <td><a href="{{ c.permalink }}">{{ c.title }}</a></td>
+  <td>{{ c.extra.tier | default(value="") }}</td>
+  <td>{{ c.extra.score | default(value="") }}</td>
+  <td>{{ c.pages | length }}</td>
+  <td>{{ c.extra.location | default(value="") }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+{% elif parts | length == 2 and parts[0] == "companies" %}
+{% set slug = parts[1] %}
+<h1>{{ section.title }}</h1>
+{{<facts extra={section.extra} />}}
+{{<says extra={section.extra} />}}
+{{<profiles extra={section.extra} />}}
+<p class="id"><code>{{ slug }}</code></p>
+{{<notes extra={section.extra} />}}
+{% if section.pages %}
+<h2>Roles</h2>
+<ul>
+{% for p in section.pages %}<li><a href="{{ p.permalink }}">{{ p.title }}</a> <code>{{ slug }}/{{ p.slug }}</code></li>{% endfor %}
+</ul>
+{% endif %}
+{% set mine = [a for a in [get_section(path=path) for path in apps.subsections] if a.extra.company == slug] %}
+{% if mine %}
+<h2>Applications here</h2>
+<ul>{% for a in mine %}<li><a href="{{ a.permalink }}">{{ a.title }}</a>: {{<app_state company={a.extra.company} />}}</li>{% endfor %}</ul>
+{% endif %}
+<article class="body">{{ section.content | safe }}</article>
+
+{% elif section.relative_path == "applications/_index.md" %}
+<h1>Applications</h1>
+<table>
+<thead><tr><th>Application</th><th>State</th></tr></thead>
+<tbody>
+{% for path in section.subsections | reverse %}{% set a = get_section(path=path) %}
+<tr><td><a href="{{ a.permalink }}">{{ a.title }}</a></td><td>{{<app_state company={a.extra.company} />}}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+
+{% elif parts | length == 2 and parts[0] == "applications" %}
+<h1>{{ section.title }}</h1>
+{{<facts extra={section.extra} />}}
+<p>Role dossier: <a href="{{ get_url(path='@/companies/' ~ section.extra.role ~ '.md') }}">{{ section.extra.role }}</a></p>
+<h2>Materials</h2>
+<ul>
+{% for p in section.pages %}<li><a href="{{ p.permalink }}">{{ p.title }}</a></li>{% endfor %}
+{% for asset in section.assets %}{% if asset is ending_with(pat=".pdf") %}<li><a href="{{ get_url(path=asset) }}">{{ asset | split(pat="/") | last }}</a></li>{% endif %}{% endfor %}
+</ul>
+{% set c = get_section(path="companies/" ~ section.extra.company ~ "/_index.md") %}{% set reached = [s for s in ["drafted", "applied", "first_call", "interview", "offer"] if c.extra[s]] %}
+{% if reached or c.extra.outcome %}
+<h2>Events</h2>
+<table>
+<thead><tr><th>Date</th><th>Stage</th></tr></thead>
+<tbody>{% for s in reached %}<tr><td>{{ c.extra[s] }}</td><td>{{ s | replace(from="_", to=" ") }}</td></tr>{% endfor %}{% if c.extra.outcome %}<tr><td>{{ c.extra.closed }}</td><td>{{ c.extra.outcome }}</td></tr>{% endif %}</tbody>
+</table>
+{% endif %}
+<article class="body">{{ section.content | safe }}</article>
+
+{% else %}
+<h1>{{ section.title }}</h1>
+<article class="body">{{ section.content | safe }}</article>
+<ul>{% for p in section.pages %}<li><a href="{{ p.permalink }}">{{ p.title }}</a></li>{% endfor %}</ul>
+{% endif %}
+{% endblock %}

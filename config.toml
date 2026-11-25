@@ -1,0 +1,10 @@
+# Zola site: `./jobs serve` for live-reload editing, `./jobs triage` for labelling.
+base_url = "/"
+title = "Role matching"
+compile_sass = false
+build_search_index = false
+# Dossiers are plain markdown; a stray {{ in one must not be read as a template.
+skip_content_templating = ["**/*.md"]
+
+[markdown]
+smart_punctuation = false

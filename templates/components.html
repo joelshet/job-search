@@ -1,0 +1,46 @@
+{% component app_state(company: string) %}{% set c = get_section(path="companies/" ~ company ~ "/_index.md") %}{% set reached = [s for s in ["drafted", "applied", "first_call", "interview", "offer"] if c.extra[s]] %}{% if c.extra.outcome %}{{ c.extra.outcome }} <small>{{ c.extra.closed }}</small>{% elif reached %}{% set s = reached | last %}{{ s | replace(from="_", to=" ") }} <small>{{ c.extra[s] }}</small>{% endif %}{% endcomponent app_state %}
+
+{% component facts(extra) %}
+{% set bits = [
+  extra.comp if extra.comp else "",
+  extra.location if extra.location else "",
+  ("score " ~ extra.score) if extra.score else "",
+  (extra.confidence ~ " confidence") if extra.confidence else "",
+  ("tier " ~ extra.tier) if extra.tier else "",
+  ("screen " ~ extra.screen) if extra.screen else "",
+  ("interview " ~ extra.interview_grade) if extra.interview_grade else "",
+  extra.category if extra.category else "",
+] %}
+<p class="facts">{{ [b for b in bits if b] | join(sep=" · ") }}{% if extra.website %}<br><a href="{{ extra.website }}">{{ extra.website | replace(from="https://", to="") | replace(from="www.", to="") }}</a>{% endif %}{% if extra.url %}<br><a href="{{ extra.url }}">{{ extra.url | replace(from="https://", to="") | truncate(length=60) }}</a>{% endif %}</p>
+{% endcomponent facts %}
+
+{# The card's facts: only what decides whether the user wants to work there. Tier, score,
+   confidence and category describe the research, and live on the company page instead. #}
+{% component card_facts(extra) %}
+{% set bits = [
+  extra.comp if extra.comp else "",
+  extra.location if extra.location else "",
+  ("screen " ~ extra.screen) if extra.screen and extra.screen != "PASS" else "",
+] %}
+<p class="facts">{{ [b for b in bits if b] | join(sep=" · ") }}{% if extra.website %}<br><a href="{{ extra.website }}">{{ extra.website | replace(from="https://", to="") | replace(from="www.", to="") }}</a>{% endif %}{% if extra.url %}<br><a href="{{ extra.url }}">{{ extra.url | replace(from="https://", to="") | truncate(length=60) }}</a>{% endif %}</p>
+{% endcomponent card_facts %}
+
+{# What the site says about itself, pulled by ./jobs shoot from its own <title> and meta description. #}
+{% component says(extra) %}{% if extra.site_title or extra.site_description %}
+<p class="says"><span class="who">their site</span>{% if extra.site_title %}<span class="site-title">{{ extra.site_title }}</span>{% endif %}{% if extra.site_description %}<br>{{ extra.site_description }}{% endif %}</p>
+{% endif %}{% if extra.site_final %}
+<p class="drift">redirects to {{ extra.site_final | replace(from="https://", to="") | replace(from="www.", to="") | truncate(length=70) }}</p>
+{% endif %}{% if extra.site_error %}
+<p class="drift">the site didn't load on {{ extra.captured }}: {{ extra.site_error }}</p>
+{% endif %}{% endcomponent says %}
+
+{% component profiles(extra) %}{% if extra.profiles %}
+<p class="profiles">{% for u in extra.profiles %}<a href="{{ u }}">{{ u | replace(from="https://", to="") | truncate(length=32, end="…") }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+{% endif %}{% endcomponent profiles %}
+
+{% component notes(extra) %}{% if extra.notes %}
+<h2>Notes</h2>
+<ul class="notes">{% for n in extra.notes %}<li>{{ n.text }} ({{ n.time[:10] }})</li>{% endfor %}</ul>
+{% endif %}{% endcomponent notes %}
+
+{% component role_label(label: string) %}<small{% if label %} data-label="{{ label }}"{% endif %}>{% if label == "Y" %}dream fit{% elif label == "y" %}yes{% elif label == "m" %}maybe{% elif label == "w" %}follow{% elif label == "n" %}no{% else %}not labelled{% endif %}</small>{% endcomponent role_label %}

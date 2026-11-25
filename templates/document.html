@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title }}</title>
+{# Styles are inlined so `./jobs pdf` can print straight from the built file. #}
+{% include "document-style.html" %}
+</head>
+<body>
+<main class="{{ page.slug }}">{{ page.content | safe }}</main>
+</body>
+</html>

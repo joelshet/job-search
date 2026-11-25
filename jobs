@@ -1,0 +1,1937 @@
+#!/usr/bin/env python3
+"""Job search machinery. Run `./jobs` with no arguments for usage."""
+
+import argparse
+import datetime
+import html
+import http.server
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+CONTENT = ROOT / "content"
+COMPANIES = CONTENT / "companies"
+APPLICATIONS = CONTENT / "applications"
+PEOPLE = CONTENT / "people"  # people, projects, and places worth meeting; ids are people/<slug>
+MATERIALS = CONTENT / "materials"
+BUILD = ROOT / "public"
+INBOX = ROOT / "_inbox"
+INBOX_ARCHIVE = ROOT / "archive" / "inbox"
+CAPTURES = ROOT / "_captures"  # arb's raw output, out of git; the JPEG beside the dossier is the record
+SHOT = "site.jpg"  # colocated with a company's _index.md, so Zola publishes it and triage shows it
+SHOT_WIDTH = 560  # the card shows it at 17rem, so this is still sharp on a 2x screen
+# arb drives Chrome on an Android phone over USB. It's a separate checkout; point $ARB at it.
+ARB = Path(os.environ.get("ARB", Path.home() / "repos/android-remote-browser/arb"))
+
+LABELS = ["Y", "y", "m", "w", "n"]  # Y dream fit, y yes, m maybe, w follow (cool, not to apply to), n no
+STAGES = ["drafted", "applied", "first_call", "interview", "offer"]
+OUTCOMES = ["accepted", "rejected", "withdrawn", "ghosted"]
+# Pipeline state: fields at the end of each dossier's [extra] table, in this order, then
+# [[extra.notes]] tables. A choice is stamped with the time it was made; a stage is only a time.
+STATE = {"triage": LABELS, "triaged": "time", "content": "flag", "issue": "flag", "profiled": "time",
+         "review": ["apply", "drop"], "reviewed": "time", **dict.fromkeys(STAGES, "time"),
+         "outcome": OUTCOMES, "closed": "time"}
+STAMPS = {"triage": "triaged", "review": "reviewed", "outcome": "closed"}
+# Independent of the label: content is worth a video or demo project, issue means the
+# screenshot doesn't show the site (cookie banner, bot check, half-loaded page).
+FLAGS = {"content", "issue"}
+TIME = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?")
+# Written only by ./jobs shoot, from the site's own HTML: never authored, never the user's.
+CAPTURE = {"captured": "time", "site_title": "text", "site_description": "text",
+           "site_final": "text", "site_error": "text", "profiles": "list"}
+MANAGED_LINE = re.compile(r"(%s)\s*=" % "|".join([*CAPTURE, *STATE]))
+state_lock = threading.Lock()  # the triage server writes from several threads
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+ZED = "/Applications/Zed.app"
+CHROMIUM = ["Google Chrome", "Brave Browser", "Arc", "Microsoft Edge", "Vivaldi"]
+BROWSERS = CHROMIUM + ["Safari"]
+
+# A company's public presence, in the order the card lists it. The number is how many path
+# segments identify the account (github.com/zoo-io, linkedin.com/company/zoo).
+PROFILE_HOSTS = [("github.com", 1), ("gitlab.com", 1), ("youtube.com", 1), ("x.com", 1),
+                 ("linkedin.com", 2), ("mastodon.social", 1), ("bsky.app", 2), ("discord.gg", 1),
+                 ("reddit.com", 2), ("instagram.com", 1), ("facebook.com", 1), ("tiktok.com", 1),
+                 ("threads.net", 1), ("twitch.tv", 1), ("patreon.com", 1), ("hackaday.io", 2),
+                 ("printables.com", 2), ("thingiverse.com", 2), ("makerworld.com", 2)]
+# Hosts that are the same account elsewhere.
+PROFILE_ALIAS = {"twitter.com": "x.com", "youtu.be": "youtube.com", "discord.com": "discord.gg"}
+# First path segments that share a page or sign you in instead of naming an account.
+NOT_PROFILE = {"intent", "share", "sharer", "sharer.php", "sharearticle", "submit", "watch",
+               "shorts", "embed", "playlist", "hashtag", "search", "explore", "login", "signup",
+               "help", "legal", "policies", "privacy", "tos", "home", "pages", "feed", "posts"}
+
+# Query parameters that only track where a click came from.
+TRACKING = re.compile(r"^(utm_.*|ref|source|src|gh_src|lever-.*|trk.*|fbclid|gclid|mc_.*)$")
+# Applicant-tracking hosts whose first path segment names the company.
+ATS_PATH = {"boards.greenhouse.io", "job-boards.greenhouse.io", "jobs.lever.co",
+            "jobs.ashbyhq.com", "apply.workable.com", "app.dover.com", "jobs.gem.com"}
+# Applicant-tracking hosts whose subdomain names the company.
+ATS_SUBDOMAIN = ("recruitee.com", "bamboohr.com", "breezy.hr", "teamtailor.com",
+                 "pinpointhq.com", "workable.com", "myworkdayjobs.com", "rippling-ats.com")
+
+
+def die(msg):
+    print(f"jobs: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def compact(text):
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def normalize_url(url):
+    """Canonical form for duplicate detection: no tracking params, fragment, or apply suffix."""
+    u = urllib.parse.urlsplit(url.strip())
+    host = u.netloc.lower().removeprefix("www.")
+    path = re.sub(r"/(apply|application)/?$", "", u.path).rstrip("/")
+    query = urllib.parse.urlencode(sorted(
+        (k, v) for k, v in urllib.parse.parse_qsl(u.query) if not TRACKING.match(k)))
+    return urllib.parse.urlunsplit(("https", host, path, query, ""))
+
+
+def company_token(url):
+    """Best guess at the company name inside a URL."""
+    u = urllib.parse.urlsplit(url)
+    host = u.netloc.lower().removeprefix("www.")
+    segments = [s for s in u.path.split("/") if s]
+    if host in ATS_PATH and segments:
+        return compact(segments[0])
+    for suffix in ATS_SUBDOMAIN:
+        if host.endswith("." + suffix):
+            return compact(host.removesuffix("." + suffix).split(".")[-1])
+    parts = host.split(".")
+    return compact(parts[-2] if len(parts) >= 2 else host)
+
+
+def looks_like_posting(url):
+    u = urllib.parse.urlsplit(url)
+    host = u.netloc.lower().removeprefix("www.")
+    segments = [s for s in u.path.split("/") if s]
+    if host in ATS_PATH:
+        return len(segments) >= 2
+    if re.match(r"(careers|jobs)\.", host) and segments:
+        return True
+    return bool(re.search(r"/(jobs?|careers?|positions?|openings?|roles?)/[^/]+", u.path)) \
+        or "gh_jid" in u.query or "jobId" in u.query
+
+
+class SitePage(HTMLParser):
+    """Enough of a captured page to describe it: its title, meta tags, and links."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meta, self.links, self.title, self._in_title = {}, [], "", False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            key = (a.get("name") or a.get("property") or "").lower()
+            if key and a.get("content", "").strip():
+                self.meta.setdefault(key, a["content"].strip())
+        elif tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif tag == "title" and not self.title:
+            self._in_title = True
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+
+def profile(url):
+    """(host, canonical url) when this link is a company profile, else None."""
+    u = urllib.parse.urlsplit(url)
+    host = u.netloc.lower().removeprefix("www.").removeprefix("m.")
+    host = PROFILE_ALIAS.get(host, host)
+    depth = next((d for h, d in PROFILE_HOSTS if host == h or host.endswith("." + h)), None)
+    if depth is None:
+        return None
+    segments = [s for s in u.path.split("/") if s]
+    if not segments or segments[0].lower() in NOT_PROFILE:
+        return None
+    if host == "youtube.com":
+        if segments[0].lower() in ("c", "channel", "user"):
+            depth = 2
+        elif not segments[0].startswith("@"):
+            return None  # a bare youtube.com path is a video, not the company's channel
+    if host == "linkedin.com" and segments[0].lower() not in ("company", "school"):
+        return None  # a founder's own profile isn't the company's presence
+    return host, f"https://{host}/" + "/".join(segments[:depth])
+
+
+def site_facts(page_html):
+    """(title, description, profile urls) as the site itself states them."""
+    p = SitePage()
+    p.feed(page_html)
+    title = re.sub(r"\s+", " ", html.unescape(p.title)).strip()
+    desc = p.meta.get("description") or p.meta.get("og:description") or ""
+    desc = re.sub(r"\s+", " ", html.unescape(desc)).strip()
+    best = {}
+    for link in p.links:
+        found = profile(link)
+        if found:
+            host, url = found
+            if host not in best or len(url) < len(best[host]):
+                best[host] = url
+    order = [h for h, _ in PROFILE_HOSTS]
+    return title, desc, [best[h] for h in order if h in best]
+
+
+def parse_value(v):
+    if v.startswith("["):
+        return json.loads(v)
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    return v
+
+
+def frontmatter(title, extra):
+    lines = ["+++", f"title = {toml_str(title)}", "[extra]"]
+    lines += [f"{k} = {toml_str(v)}" for k, v in extra.items() if v not in (None, "")]
+    return "\n".join(lines + ["+++", ""])
+
+
+def read_body_from_stdin():
+    if sys.stdin.isatty():
+        die("pipe the dossier body (BLUF paragraph first) on stdin")
+    body = sys.stdin.read().strip()
+    if not body:
+        die("dossier body on stdin is empty")
+    return body + "\n"
+
+
+FRONTMATTER = re.compile(r"\+\+\+\n(.*?)\n\+\+\+\n?", re.S)
+
+
+def read_doc(path):
+    """Return (frontmatter dict, body) for a +++ TOML-fronted markdown file."""
+    text = path.read_text()
+    m = FRONTMATTER.match(text)
+    if not m:
+        die(f"{path.relative_to(ROOT)}: missing +++ frontmatter")
+    try:
+        return tomllib.loads(m.group(1)), text[m.end():]
+    except tomllib.TOMLDecodeError as e:
+        die(f"{path.relative_to(ROOT)}: {e}")
+
+
+def cell_toml(v):
+    if v is True:
+        return "true"
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_str(str(i)) for i in v) + "]"
+    return toml_str(v)
+
+
+def toml_str(s):
+    return json.dumps(s, ensure_ascii=False)
+
+
+def cell(v):
+    """A frontmatter value as a TSV cell."""
+    return "-" if v is None else "true" if v is True else str(v)
+
+
+# ---- model -----------------------------------------------------------------
+
+def companies():
+    for d in sorted(COMPANIES.iterdir()):
+        if d.is_dir() and (d / "_index.md").exists():
+            yield d.name, d
+
+
+def roles():
+    """Yield (role_id, path, frontmatter) for every role dossier."""
+    for slug, d in companies():
+        for p in sorted(d.glob("*.md")):
+            if p.name != "_index.md":
+                yield f"{slug}/{p.stem}", p, read_doc(p)[0]
+
+
+def dossiers(kind="all"):
+    """Yield (id, path, frontmatter) for every company, then every role."""
+    if kind in ("all", "company"):
+        for slug, d in companies():
+            yield slug, d / "_index.md", read_doc(d / "_index.md")[0]
+    if kind in ("all", "role"):
+        yield from roles()
+
+
+def applications():
+    """Yield (app_id, dir, frontmatter) for every application."""
+    if not APPLICATIONS.exists():
+        return
+    for d in sorted(APPLICATIONS.iterdir()):
+        if d.is_dir() and (d / "_index.md").exists():
+            yield d.name, d, read_doc(d / "_index.md")[0]
+
+
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def dossier_id(arg):
+    """Accept a slug, company/role, or a path to the dossier file."""
+    return arg.removeprefix("content/").removeprefix("companies/").removesuffix(".md").removesuffix("/_index")
+
+
+def dossier_path(ident):
+    """The dossier file for a company slug or company/role id, or None."""
+    if not re.fullmatch(r"[a-z0-9-]+(/[a-z0-9-]+)?", ident):
+        return None
+    if ident.startswith("people/"):
+        path = CONTENT / f"{ident}.md"
+        return path if path.exists() else None
+    path = COMPANIES / (f"{ident}.md" if "/" in ident else f"{ident}/_index.md")
+    return path if path.exists() else None
+
+
+def state_problems(extra):
+    """Messages for pipeline fields and notes that break the rules in STATE."""
+    problems = []
+    for key, kind in STATE.items():
+        if key not in extra:
+            continue
+        v = extra[key]
+        if kind == "time" and not (isinstance(v, str) and TIME.fullmatch(v)):
+            problems.append(f"{key} = {v!r} is not YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS")
+        elif kind == "flag" and v is not True:
+            problems.append(f"{key} must be true or absent")
+        elif isinstance(kind, list) and v not in kind:
+            problems.append(f"{key} must be one of: {' '.join(kind)}")
+    for choice, stamp in STAMPS.items():
+        if (choice in extra) != (stamp in extra):
+            problems.append(f"{choice} and {stamp} are set together")
+    if "review" in extra and "profiled" not in extra:
+        problems.append("review needs profiled first")
+    for note in extra.get("notes", []):
+        if not (isinstance(note, dict) and set(note) == {"time", "text"}
+                and TIME.fullmatch(str(note["time"])) and str(note["text"]).strip()):
+            problems.append(f"note {note!r} needs exactly a time and a text")
+    return problems
+
+
+def without(text, keys):
+    """A dossier's frontmatter and body with these [extra] fields removed, for comparing versions."""
+    m = FRONTMATTER.match(text)
+    try:
+        fm = tomllib.loads(m.group(1))
+    except (AttributeError, tomllib.TOMLDecodeError):
+        return text
+    for key in keys:
+        fm.get("extra", {}).pop(key, None)
+    return fm, text[m.end():]
+
+
+def without_state(text):
+    """Everything but the user's labels, notes, and flags: what commit_state compares."""
+    return without(text, [*STATE, "notes"])
+
+
+def write_state(path, changes, notes=()):
+    """Set fields (a None value removes one) and append (time, text) notes in a dossier's frontmatter.
+
+    Handles the pipeline fields in STATE and the captured fields in CAPTURE, which sit in that
+    order at the end of the [extra] table. Other frontmatter lines and the body stay byte for
+    byte. Refuses to write a result that breaks the rules in STATE or parses differently from
+    what was asked."""
+    with state_lock:
+        text = path.read_text()
+        m = FRONTMATTER.match(text)
+        if not m:
+            die(f"{path.relative_to(ROOT)}: missing +++ frontmatter")
+        extra = tomllib.loads(m.group(1)).get("extra", {})
+        managed = [*CAPTURE, *STATE]
+        state = {k: extra[k] for k in managed if k in extra}
+        for k, v in changes.items():
+            if v is None:
+                state.pop(k, None)
+            else:
+                state[k] = v
+
+        lines = m.group(1).split("\n")
+        if "[extra]" not in lines:
+            lines.append("[extra]")
+        start = lines.index("[extra]") + 1
+        end = next((i for i in range(start, len(lines)) if lines[i].startswith("[")), len(lines))
+        table = [line for line in lines[start:end] if not MANAGED_LINE.match(line)]
+        while table and not table[-1].strip():
+            table.pop()
+        table += [f"{k} = {cell_toml(state[k])}" for k in managed if k in state]
+        tail = lines[end:]
+        for time, note in notes:
+            tail += ["", "[[extra.notes]]", f"time = {toml_str(time)}", f"text = {toml_str(note.strip())}"]
+        fm = "\n".join(lines[:start] + table + ([""] if end < len(lines) else []) + tail)
+        new = f"+++\n{fm}{text[m.end(1):]}"
+
+        new_extra = tomllib.loads(fm).get("extra", {})
+        problems = state_problems(new_extra)
+        if without(text, [*managed, "notes"]) != without(new, [*managed, "notes"]) \
+                or {k: new_extra[k] for k in managed if k in new_extra} != state \
+                or new_extra.get("notes", []) != extra.get("notes", []) + [{"time": t, "text": n.strip()} for t, n in notes]:
+            problems.append("the rewritten frontmatter doesn't match the change; nothing written")
+        if problems:
+            die(f"{path.relative_to(ROOT)}: " + "; ".join(problems))
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new)
+        os.replace(tmp, path)
+
+
+AUTHORED = {"screen": ["PASS", "HOLD", "FAIL"], "confidence": ["low", "medium", "high"],
+            "location": "text", "tier": [1, 2, 3], "category": "text"}
+VERDICT_LEAD = re.compile(r"^(PASS|HOLD|FAIL)\b", re.I)
+CARD_WORDS = 110  # tier 1: the description plus at most 80 words, and a case against
+
+
+def set_fields(path, fields):
+    """Set authored [extra] scalars, leaving the managed fields and the body untouched."""
+    text = path.read_text()
+    m = FRONTMATTER.match(text)
+    if not m:
+        die(f"{path.relative_to(ROOT)}: missing +++ frontmatter")
+    lines = m.group(1).split("\n")
+    start = lines.index("[extra]") + 1 if "[extra]" in lines else len(lines)
+    end = next((i for i in range(start, len(lines)) if lines[i].startswith("[")), len(lines))
+    at = next((i for i in range(start, end) if MANAGED_LINE.match(lines[i])), end)
+    for key, value in fields.items():
+        line = f"{key} = {cell_toml(value)}"
+        here = next((i for i in range(start, end) if re.match(rf"{key}\s*=", lines[i])), None)
+        if here is None:
+            lines.insert(at, line)
+            at += 1
+            end += 1
+        else:
+            lines[here] = line
+    new = f"+++\n{'\n'.join(lines)}{text[m.end(1):]}"
+    extra = tomllib.loads("\n".join(lines)).get("extra", {})
+    for key, value in fields.items():
+        kind = AUTHORED.get(key)
+        if isinstance(kind, list) and value not in kind:
+            die(f"{key} must be one of: {' '.join(str(k) for k in kind)}")
+        if extra.get(key) != value:
+            die(f"{path.relative_to(ROOT)}: {key} did not round-trip; nothing written")
+    if without(text, [*CAPTURE, *STATE, "notes", *fields]) != without(new, [*CAPTURE, *STATE, "notes", *fields]):
+        die(f"{path.relative_to(ROOT)}: the rewrite changed more than {', '.join(fields)}")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(new)
+    os.replace(tmp, path)
+
+
+def write_card(path, card):
+    """Replace the first paragraph and the case against, keeping any later sections."""
+    fm, body = read_doc(path)
+    card = card.strip() + "\n"
+    first = card.split("\n\n")[0].strip()
+    if VERDICT_LEAD.match(first):
+        die("the first paragraph describes the company; the screen field carries PASS, HOLD or FAIL")
+    if "## Case against" not in card:
+        die("the card needs a '## Case against' section")
+    if len(card.split()) > CARD_WORDS:
+        die(f"{len(card.split())} words; a tier 1 card is at most {CARD_WORDS}")
+    keep = ""
+    for m in re.finditer(r"^## (.+)$", body, re.M):
+        if m.group(1).strip().lower() != "case against":
+            keep = body[m.start():]
+            break
+    text = path.read_text()
+    head = text[:FRONTMATTER.match(text).end()]
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(head + card + ("\n" + keep if keep else ""))
+    os.replace(tmp, path)
+
+
+def capture_index():
+    """Map a captured URL to its newest capture directory."""
+    index = {}
+    for run in sorted(CAPTURES.glob("*"), key=lambda d: d.name):
+        for d in run.iterdir():
+            meta = d / "meta.json"
+            if meta.exists():
+                try:
+                    index[normalize_url(json.loads(meta.read_text())["requested"])] = d
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    return index
+
+
+def cmd_evidence(args):
+    """Print what the phone saw for each company: the site's own words, links, and page text."""
+    ids = [dossier_id(i) for i in args.ids]
+    if not ids:
+        ids = [slug for slug, d in companies()
+               if (lambda e: e.get("captured") and not e.get("screen"))(read_doc(d / "_index.md")[0].get("extra", {}))]
+    index = capture_index()
+    for ident in ids:
+        path = COMPANIES / ident / "_index.md"
+        if not path.exists():
+            print(f"# {ident}: no dossier", flush=True)
+            continue
+        fm, body = read_doc(path)
+        extra = fm.get("extra", {})
+        d = index.get(normalize_url(extra.get("website", ""))) if extra.get("website") else None
+        print(f"### {ident}")
+        print(f"name: {fm['title']}")
+        print(f"website: {extra.get('website', '-')}")
+        print(f"category: {extra.get('category', '-')}")
+        print(f"captured: {extra.get('captured', 'not captured')}")
+        for key in ("site_final", "site_error", "site_title", "site_description"):
+            if extra.get(key):
+                print(f"{key}: {extra[key]}")
+        if extra.get("profiles"):
+            print("profiles: " + " ".join(extra["profiles"]))
+        print(f"card now: {body.strip().split(chr(10) + chr(10))[0]}")
+        if d and (d / "text.txt").exists():
+            text = re.sub(r"\n{2,}", "\n", (d / "text.txt").read_text(errors="replace")).strip()
+            print(f"--- page text ({d.name}) ---")
+            print(text[:args.chars])
+        print("### end\n", flush=True)
+
+
+def cmd_reprocess(args):
+    """Re-read the site's words from captures already on disk. No phone needed."""
+    index = capture_index()
+    print("\t".join(["id", "profiles", "changed"]))
+    for slug, d in companies():
+        path = d / "_index.md"
+        extra = read_doc(path)[0].get("extra", {})
+        cap = index.get(normalize_url(extra.get("website", ""))) if extra.get("website") else None
+        if not cap or not (cap / "page.html").exists():
+            continue
+        meta = json.loads((cap / "meta.json").read_text())
+        title, desc, profiles = site_facts((cap / "page.html").read_text(errors="replace"))
+        same = company_token(meta["url"]) == company_token(meta["requested"])
+        changes = {"captured": extra.get("captured") or today(), "site_title": title or None,
+                   "site_description": desc or None, "site_final": None if same else meta["url"],
+                   "profiles": profiles or None, "site_error": None}
+        was = {k: extra.get(k) for k in changes}
+        if was == changes:
+            continue
+        write_state(path, changes)
+        print("\t".join([slug, str(len(profiles)),
+                          ",".join(k for k in changes if was.get(k) != changes[k])]), flush=True)
+
+
+def cmd_card(args):
+    """Screen a company and rewrite its card from the evidence."""
+    path = dossier_path(dossier_id(args.id))
+    if not path or path.name != "_index.md":
+        die(f"'{args.id}' is not a company")
+    fields = {"screen": args.screen}
+    if args.confidence:
+        fields["confidence"] = args.confidence
+    if args.location:
+        fields["location"] = args.location
+    card = sys.stdin.read()
+    if not card.strip():
+        die("pipe the card body (first paragraph, then ## Case against) on stdin")
+    write_card(path, card)
+    set_fields(path, fields)
+    print(dossier_id(args.id))
+
+
+def add_note(ident, note, time=None):
+    write_state(dossier_path(ident), {}, [(time or now(), note)])
+
+
+def current_flags():
+    """Map id to the set of flags currently on."""
+    flags = {}
+    for ident, _, fm in triage_items():
+        on = {f for f in FLAGS if fm.get("extra", {}).get(f)}
+        if on:
+            flags[ident] = on
+    return flags
+
+
+def triage_labels():
+    """Current triage label per dossier id."""
+    return {ident: fm["extra"]["triage"] for ident, _, fm in triage_items() if fm.get("extra", {}).get("triage")}
+
+
+def pipeline_state(extra):
+    """(state, since): the outcome once closed, otherwise the furthest stage reached."""
+    if extra.get("outcome"):
+        return extra["outcome"], extra.get("closed", "")
+    reached = [s for s in STAGES if s in extra]
+    return (reached[-1], extra[reached[-1]]) if reached else ("", "")
+
+
+def find_app(query):
+    matches = [a for a in applications() if query in a[0]]
+    exact = [a for a in matches if a[0] == query]
+    if exact:
+        return exact[0]
+    if not matches:
+        die(f"no application matches '{query}'")
+    if len(matches) > 1:
+        die(f"'{query}' matches several applications:\n  "
+            + "\n  ".join(a[0] for a in matches))
+    return matches[0]
+
+
+def company_index():
+    """Map compacted slug, title, and website host tokens to company slugs."""
+    index = {}
+    for slug, d in companies():
+        fm = read_doc(d / "_index.md")[0]
+        keys = {compact(slug), compact(fm["title"])}
+        for field in ("website", "careers"):
+            if fm.get("extra", {}).get(field):
+                keys.add(company_token(fm["extra"][field]))
+        for k in fm.get("extra", {}).get("aliases", []):
+            keys.add(compact(k))
+        for k in keys:
+            index.setdefault(k, slug)
+    return index
+
+
+def known_urls():
+    """Map normalized posting URL to (kind, id) for every role and application."""
+    urls = {}
+    for role_id, _, fm in roles():
+        if fm.get("extra", {}).get("url"):
+            urls[normalize_url(fm["extra"]["url"])] = ("role", role_id)
+    for app_id, _, fm in applications():
+        if fm.get("extra", {}).get("url"):
+            urls[normalize_url(fm["extra"]["url"])] = ("applied", app_id)
+    return urls
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_serve(args):
+    os.chdir(ROOT)
+    os.execvp("zola", ["zola", "serve", "--port", str(args.port), "--open"])
+
+
+def zola_build():
+    r = subprocess.run(["zola", "build", "--output-dir", str(BUILD), "--force"],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode:
+        sys.stderr.write(r.stdout + r.stderr)
+        return False
+    return True
+
+
+def commit_state():
+    """Commit dossiers whose only uncommitted change is pipeline fields or notes.
+
+    A dossier that also has research edits is left for the commit that goes with those edits."""
+    r = subprocess.run(["git", "diff", "--name-only", "HEAD", "--", str(COMPANIES), str(PEOPLE)],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode:
+        return
+    paths = []
+    for name in r.stdout.splitlines():
+        head = subprocess.run(["git", "show", f"HEAD:{name}"], cwd=ROOT, capture_output=True, text=True)
+        work = ROOT / name
+        if name.endswith(".md") and not head.returncode and work.exists() \
+                and without_state(head.stdout) == without_state(work.read_text()):
+            paths.append(name)
+    if not paths:
+        return
+    subprocess.run(["git", "add", "--", *paths], cwd=ROOT, check=True)
+    r = subprocess.run(["git", "commit", "-q", "-m", "Record triage labels, notes, and content flags", "--", *paths],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode:
+        sys.stderr.write(r.stdout + r.stderr)
+    else:
+        print(f"triage: committed labels, notes, and flags in {len(paths)} dossiers")
+
+
+def cmd_triage(args):
+    # Commit on the way in too, so a session that ended without ctrl-c still lands in git.
+    commit_state()
+    if not zola_build():
+        die("zola build failed")
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(BUILD), **kw)
+
+        def log_message(self, *a):
+            pass
+
+        def send_json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/api/labels":
+                return self.send_json(triage_labels())
+            if self.path == "/api/flags":
+                return self.send_json({k: sorted(v) for k, v in current_flags().items()})
+            if self.path == "/api/notes":
+                return self.send_json({ident: [[n["time"][:10], n["text"]] for n in fm["extra"]["notes"]]
+                                       for ident, _, fm in triage_items() if fm.get("extra", {}).get("notes")})
+            if self.path == "/":
+                # The home page counts labels at build time, so rebuild to show the ones just made.
+                zola_build()
+            super().do_GET()
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(n) or b"{}")
+            path = dossier_path(str(data.get("id", "")))
+            try:
+                if self.path == "/api/label":
+                    label = data.get("label")
+                    if label not in LABELS + [""] or not path:
+                        return self.send_json({"error": "bad label"}, 400)
+                    write_state(path, {"triage": label, "triaged": now()} if label else {"triage": None, "triaged": None})
+                    return self.send_json({"ok": True})
+                if self.path == "/api/flag":
+                    if data.get("flag") not in FLAGS or not path:
+                        return self.send_json({"error": "bad flag"}, 400)
+                    write_state(path, {data["flag"]: True if data.get("on") else None})
+                    return self.send_json({"ok": True})
+                if self.path == "/api/note":
+                    if not str(data.get("note", "")).strip() or not path:
+                        return self.send_json({"error": "bad note"}, 400)
+                    write_state(path, {}, [(now(), data["note"])])
+                    return self.send_json({"ok": True})
+            except SystemExit:
+                return self.send_json({"error": "not saved; see the terminal"}, 400)
+            if self.path == "/api/rebuild":
+                return self.send_json({"ok": zola_build()})
+            if self.path == "/api/edit":
+                if not path:
+                    return self.send_json({"error": "not found"}, 404)
+                if shutil.which("zed"):
+                    cmd = ["zed", str(path)]
+                elif Path(ZED).exists():
+                    cmd = ["open", "-a", ZED, str(path)]
+                else:
+                    cmd = ["open", "-t", str(path)]
+                subprocess.Popen(cmd)
+                return self.send_json({"ok": True})
+            self.send_json({"error": "not found"}, 404)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}/triage/"
+    print(f"triage: {url}  (ctrl-c to stop)")
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        commit_state()
+
+
+def cmd_apply(args):
+    resume = MATERIALS / args.resume
+    if not resume.exists():
+        die(f"no resume at {resume.relative_to(ROOT)}")
+    role_id = args.role.removeprefix("companies/").removesuffix(".md")
+    path = COMPANIES / f"{role_id}.md"
+    if not path.exists():
+        die(f"no role dossier at {path.relative_to(ROOT)}")
+    fm, body = read_doc(path)
+    extra = fm.get("extra", {})
+    company_slug, role_slug = role_id.split("/", 1)
+    company_path = COMPANIES / company_slug / "_index.md"
+    company_fm = read_doc(company_path)[0]
+    company = company_fm["title"]
+
+    for app_id, _, afm in applications():
+        a = afm.get("extra", {})
+        same_url = extra.get("url") and a.get("url") and \
+            normalize_url(a["url"]) == normalize_url(extra["url"])
+        if a.get("role") == role_id or same_url:
+            state, when = pipeline_state(company_fm.get("extra", {}))
+            msg = f"already have {app_id} for {role_id} ({state} {when})"
+            if not args.force:
+                die(msg + "; pass --force to start another")
+            print(f"warning: {msg}", file=sys.stderr)
+
+    app_id = f"{today()}-{company_slug}-{role_slug}"
+    d = APPLICATIONS / app_id
+    if d.exists():
+        die(f"{d.relative_to(ROOT)} already exists")
+    d.mkdir(parents=True)
+
+    title = company + ": " + fm["title"]
+    (d / "_index.md").write_text(
+        "+++\n"
+        f"title = {toml_str(title)}\n"
+        "[extra]\n"
+        f"role = {toml_str(role_id)}\n"
+        f"company = {toml_str(company_slug)}\n"
+        f"url = {toml_str(extra.get('url', ''))}\n"
+        f"comp = {toml_str(extra.get('comp', ''))}\n"
+        "+++\n"
+    )
+    posting = path.with_name(f"{role_slug}.posting.txt")
+    jd = posting.read_text() if posting.exists() else (
+        f"<!-- Paste the full posting from {extra.get('url', 'the listing')}. "
+        "Postings disappear, so keep the text. -->\n")
+    (d / "job-description.md").write_text("+++\ntitle = \"Job description\"\n+++\n" + jd)
+    shutil.copy(resume, d / "resume.md")
+    shutil.copy(MATERIALS / "cover-letter.md", d / "cover-letter.md")
+    (d / "questions.md").write_text(
+        "+++\ntitle = \"Questions and answers\"\n+++\n"
+        "<!-- Application form questions and what you answered, as ## question / answer. -->\n"
+    )
+    write_state(company_path, {"drafted": now()})
+    print(d.relative_to(ROOT))
+
+
+def cmd_set(args):
+    ident = dossier_id(args.id)
+    path = dossier_path(ident) or die(f"no company or role dossier '{ident}'")
+    changes = {}
+    for arg in args.fields:
+        key, eq, value = arg.partition("=")
+        kind = STATE.get(key)
+        if kind is None:
+            die(f"unknown field '{key}'; fields are: {' '.join(STATE)}")
+        if eq and not value:
+            changes[key] = None
+            if key in STAMPS:
+                changes[STAMPS[key]] = None
+        elif kind == "time":
+            changes[key] = value or now()
+        elif kind == "flag":
+            if value:
+                die(f"'{key}' sets {key} and '{key}=' clears it; it takes no value")
+            changes[key] = True
+        elif value in kind:
+            changes[key] = value
+            changes.setdefault(STAMPS[key], now())
+        else:
+            die(f"{key} must be one of: {' '.join(kind)}")
+    write_state(path, changes)
+    extra = read_doc(path)[0].get("extra", {})
+    for key in changes:
+        print(f"{ident}\t{key}\t{cell(extra.get(key))}")
+
+
+def cmd_status(args):
+    rows = []
+    for app_id, _, fm in applications():
+        company = read_doc(COMPANIES / fm["extra"]["company"] / "_index.md")[0].get("extra", {})
+        state, when = pipeline_state(company)
+        rows.append((state, when, company.get("applied", ""), app_id))
+    if not rows:
+        print("no applications yet", file=sys.stderr)
+        return
+    print("state\tsince\tapplied\tapplication")
+    for r in rows:
+        print("\t".join(r))
+
+
+def cmd_note(args):
+    ident = dossier_id(args.id)
+    if not dossier_path(ident):
+        die(f"no company or role dossier '{ident}'")
+    text = " ".join(args.text) if args.text else (sys.stdin.read() if not sys.stdin.isatty() else "")
+    if not text.strip():
+        die("give the note as arguments or on stdin")
+    add_note(ident, text)
+
+
+def cmd_notes(args):
+    """TSV of notes with the current label, oldest first."""
+    rows = []
+    for ident, _, fm in dossiers():
+        if not args.id or ident == args.id or ident.startswith(args.id + "/"):
+            extra = fm.get("extra", {})
+            rows += [(n["time"], ident, extra.get("triage", "-"), n["text"]) for n in extra.get("notes", [])]
+    if not rows:
+        print("no notes", file=sys.stderr)
+        return
+    print("time\tid\tlabel\tnote")
+    for r in sorted(rows):
+        print("\t".join(r))
+
+
+def cmd_list(args):
+    """TSV with a header: id, every pipeline field in STATE order (- when empty), title."""
+    print("\t".join(["id", *STATE, "title"]))
+    for ident, _, fm in dossiers(args.kind):
+        extra = fm.get("extra", {})
+        if (args.label is None or extra.get("triage", "") == args.label) and (args.flag is None or extra.get(args.flag)):
+            print("\t".join([ident, *(cell(extra.get(k)) for k in STATE), fm["title"]]))
+
+
+def cmd_check(args):
+    problems = []
+    for ident, _, fm in dossiers():
+        extra = fm.get("extra", {})
+        # Only where it matters: triage's o key opens the website, and a company the user already
+        # said no to never comes back up.
+        if "/" not in ident and not extra.get("website") \
+                and extra.get("triage") != "n" and extra.get("screen") != "FAIL":
+            problems.append(f"{ident}: company has no extra.website (triage's o key needs it)")
+        problems += [f"{ident}: {p}" for p in state_problems(extra)]
+    urls = {}
+    for role_id, path, fm in roles():
+        url = normalize_url(fm.get("extra", {}).get("url", "")) if fm.get("extra", {}).get("url") else ""
+        if not url:
+            problems.append(f"{role_id}: role has no extra.url")
+        elif url in urls:
+            problems.append(f"{role_id}: same url as {urls[url]}")
+        else:
+            urls[url] = role_id
+    seen = {}
+    role_ids = {r[0] for r in roles()}
+    for app_id, _, fm in applications():
+        role = fm.get("extra", {}).get("role", "")
+        if role not in role_ids:
+            problems.append(f"{app_id}: role '{role}' has no dossier")
+        if role in seen:
+            problems.append(f"{app_id}: duplicate application for {role} (also {seen[role]})")
+        seen[role] = app_id
+    for p in problems:
+        print(p, file=sys.stderr)
+    if problems:
+        sys.exit(1)
+
+
+def shot_path(slug):
+    return COMPANIES / slug / SHOT
+
+
+def shoot_targets(args):
+    """(slug, website) per company to capture, in dossier order."""
+    if args.ids:
+        out, done = [], 0
+        for ident in [dossier_id(i) for i in args.ids]:
+            if "/" in ident or not (COMPANIES / ident / "_index.md").exists():
+                die(f"'{ident}' is not a company")
+            extra = read_doc(COMPANIES / ident / "_index.md")[0].get("extra", {})
+            if not extra.get("website"):
+                print(f"{ident}: no extra.website to capture", file=sys.stderr)
+                continue
+            if extra.get("captured") and not args.again:
+                done += 1
+                continue
+            out.append((ident, extra["website"]))
+        if done:
+            print(f"{done} already captured; --again retakes them", file=sys.stderr)
+        return out
+    out = []
+    for slug, d in companies():
+        extra = read_doc(d / "_index.md")[0].get("extra", {})
+        if not extra.get("website"):
+            continue
+        if args.issues:
+            if extra.get("issue"):
+                out.append((slug, extra["website"]))
+        elif args.errors:
+            if extra.get("site_error"):
+                out.append((slug, extra["website"]))
+        elif args.again or not extra.get("captured"):
+            out.append((slug, extra["website"]))
+    return out
+
+
+def shrink(png, jpg):
+    """A phone screenshot is 1080px wide and 170KB; the card needs neither."""
+    r = subprocess.run(["sips", "-Z", str(SHOT_WIDTH), "-s", "format", "jpeg",
+                        "-s", "formatOptions", "70", str(png), "--out", str(jpg)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if r.returncode:
+        die(f"sips failed on {png}: {r.stderr.strip()}")
+
+
+def capture_dossier(slug, site, status, ms, rest):
+    """File one crawled site: the screenshot, and what the site says about itself."""
+    path = COMPANIES / slug / "_index.md"
+    if status == "error":
+        write_state(path, {"captured": today(), "site_error": rest})
+        print("\t".join([slug, "error", "-", "-", "-", "-", rest]), flush=True)
+        return False
+    meta = json.loads((Path(rest) / "meta.json").read_text())
+    png = Path(rest) / "shot.png"
+    shot = SHOT if png.exists() else "-"
+    if png.exists():
+        shrink(png, shot_path(slug))
+    title, desc, profiles = site_facts((Path(rest) / "page.html").read_text(errors="replace"))
+    same = company_token(meta["url"]) == company_token(site)
+    write_state(path, {
+        "captured": today(), "site_title": title or None, "site_description": desc or None,
+        "site_final": None if same else meta["url"], "profiles": profiles or None,
+        "site_error": None, **({"issue": None} if shot == SHOT else {})})
+    print("\t".join([slug, str(meta["status"]), ms, shot, str(len(profiles)),
+                     "-" if same else meta["url"], meta["title"]]), flush=True)
+    return png.exists()
+
+
+def cmd_shoot(args):
+    """Screenshot each company's website on the phone and file it beside the dossier."""
+    if not os.access(ARB, os.X_OK):
+        die(f"no arb at {ARB} (set $ARB to the android-remote-browser checkout)")
+    targets = shoot_targets(args)
+    if args.limit:
+        targets = targets[:args.limit]
+    if not targets:
+        print("nothing to shoot", file=sys.stderr)
+        return
+    out = CAPTURES / datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S")
+    out.mkdir(parents=True)
+    print(f"shooting {len(targets)} sites on the phone into {out.relative_to(ROOT)}", file=sys.stderr)
+    print("\t".join(["id", "status", "ms", "shot", "profiles", "final_url", "title"]))
+    failed, total = 0, len(targets)
+    # arb has died mid-run on long crawls, so keep starting it again while it still makes
+    # progress. Each pass reuses the same directory, where arb skips what it already captured.
+    while targets:
+        done, failed = crawl(targets, out, failed)
+        targets = [(slug, site) for slug, site in targets
+                   if not read_doc(COMPANIES / slug / "_index.md")[0].get("extra", {}).get("captured")]
+        if not done or not targets:
+            break
+        print(f"arb stopped with {len(targets)} left; starting it again", file=sys.stderr)
+    if failed:
+        print(f"{failed} of {total} produced no screenshot", file=sys.stderr)
+        sys.exit(1)
+
+
+def crawl(targets, out, failed):
+    """One arb crawl over these targets. Returns (how many it filed, the running failure count)."""
+    done = 0
+    slugs = {normalize_url(site): slug for slug, site in targets}
+    p = subprocess.Popen([str(ARB), "crawl", "-o", str(out), "--shot"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def feed():
+        """A thread, so a full stdout pipe can never stall the URLs going in."""
+        with p.stdin:
+            for _, site in targets:
+                p.stdin.write(site + "\n")
+
+    threading.Thread(target=feed, daemon=True).start()
+    try:
+        for line in p.stdout:
+            if not line.endswith("\n"):
+                break  # arb died mid-line; the outer loop starts it again
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 4:
+                continue
+            status, ms, site, rest = fields
+            slug = slugs.get(normalize_url(site)) if site else None
+            if not slug:
+                failed += 1
+                print("\t".join(["?", "unmatched", "-", "-", "-", site, rest]), flush=True)
+                continue
+            try:
+                done += 1
+                if not capture_dossier(slug, site, status, ms, rest):
+                    failed += 1
+            except (OSError, ValueError, KeyError, SystemExit) as e:
+                failed += 1
+                print("\t".join([slug, "unsaved", "-", "-", "-", "-", str(e)]), flush=True)
+    except KeyboardInterrupt:
+        p.terminate()
+        print("stopped; rerun to pick up where it left off", file=sys.stderr)
+        p.wait()
+        sys.exit(130)
+    p.wait()
+    return done, failed
+
+
+def cmd_inbox(args):
+    """List inbox files, then classify every URL found in their text."""
+    files = sorted(p for p in INBOX.rglob("*") if p.is_file() and not p.name.startswith("."))
+    if not files:
+        print("inbox is empty", file=sys.stderr)
+        return
+    print("# files")
+    for f in files:
+        print(f"{f.stat().st_size}\t{f.relative_to(ROOT)}")
+    urls = []
+    for f in files:
+        try:
+            text = f.read_text()
+        except UnicodeDecodeError:
+            continue
+        found = re.findall(r"https?://[^\s<>\"')\]]+", text)
+        # A saved page's own URL is its first line; links inside the page text are noise.
+        urls += [(u, f) for u in (found[:1] if f.name.endswith(".page.txt") else found)]
+    if urls:
+        print("# urls")
+        match_urls(urls)
+
+
+def osascript(script):
+    r = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout
+
+
+def as_quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def pick_browser(name):
+    if name:
+        if name not in BROWSERS:
+            die(f"--browser must be one of: {', '.join(BROWSERS)}")
+        return name
+    front = osascript('tell application "System Events" to get name of first process whose frontmost is true').strip()
+    if front in BROWSERS:
+        return front
+    running = osascript('tell application "System Events" to get name of every process').strip().split(", ")
+    for b in BROWSERS:
+        if b in running:
+            return b
+    die("no supported browser is running")
+
+
+def browser_tabs(browser, with_text):
+    """Return [(url, title, text)] for the front window's tabs."""
+    title_prop = "name" if browser == "Safari" else "title"
+    out = osascript(f'''
+set sep to (ASCII character 31)
+set out to ""
+tell application {as_quote(browser)}
+  repeat with t in tabs of front window
+    set out to out & (URL of t) & sep & ({title_prop} of t) & linefeed
+  end repeat
+end tell
+return out''')
+    tabs = [line.split("\x1f", 1) + [""] for line in out.splitlines() if "\x1f" in line]
+    tabs = [(u, title, "") for u, title, _ in tabs if u.startswith("http")]
+    if not with_text:
+        return tabs
+    result, warned = [], False
+    for i, (url, title, _) in enumerate(tabs):
+        text = ""
+        try:
+            if browser == "Safari":
+                js = f'tell application "Safari" to do JavaScript "document.body.innerText" in (first tab of front window whose URL is {as_quote(url)})'
+            else:
+                js = f'tell application {as_quote(browser)} to execute (first tab of front window whose URL is {as_quote(url)}) javascript "document.body.innerText"'
+            text = osascript(js)
+        except RuntimeError as e:
+            if not warned:
+                where = "Safari: Develop menu" if browser == "Safari" else f"{browser}: View > Developer menu"
+                print(f"jobs: page text not captured ({e}). Turn on 'Allow JavaScript from Apple Events' in {where}, or pass --no-text.",
+                      file=sys.stderr)
+                warned = True
+        result.append((url, title, text))
+    return result
+
+
+def write_grab(tabs, intent, browser):
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    d = INBOX / f"{stamp}-{intent}"
+    d.mkdir(parents=True)
+    lines = [f"# intent: {intent}", f"# browser: {browser}"]
+    lines += [f"{url}\t{title}" for url, title, _ in tabs]
+    (d / "tabs.txt").write_text("\n".join(lines) + "\n")
+    for i, (url, title, text) in enumerate(tabs, 1):
+        if text.strip():
+            (d / f"{i:02d}.page.txt").write_text(f"{url}\n{title}\n\n{text.strip()}\n")
+    return d
+
+
+def cmd_grab(args):
+    browser = pick_browser(args.browser)
+    try:
+        tabs = browser_tabs(browser, not args.no_text)
+    except RuntimeError as e:
+        die(f"could not read {browser} tabs: {e}. The first run needs macOS to allow automation of {browser}.")
+    if not tabs:
+        die(f"no web tabs in the front {browser} window")
+    d = write_grab(tabs, args.intent, browser)
+    print(d.relative_to(ROOT))
+    if args.go:
+        prompt = "Process the inbox" if args.intent == "research" else "Process the inbox and start applications for the grabbed roles"
+        cmd = f"cd {shlex.quote(str(ROOT))} && claude {shlex.quote(prompt)}"
+        if Path("/Applications/iTerm.app").exists():
+            osascript(f'''tell application "iTerm"
+  activate
+  set w to (create window with default profile)
+  tell current session of w to write text {as_quote(cmd)}
+end tell''')
+        else:
+            osascript(f'tell application "Terminal" to do script {as_quote(cmd)}')
+        if Path(ZED).exists():
+            subprocess.run(["open", "-a", ZED, str(d / "tabs.txt")])
+
+
+def cmd_match(args):
+    text = sys.stdin.read() if not args.files else ""
+    pairs = [(u, Path("-")) for u in re.findall(r"https?://[^\s<>\"')\]]+", text)]
+    for name in args.files:
+        pairs += [(u, Path(name)) for u in re.findall(r"https?://[^\s<>\"')\]]+", Path(name).read_text())]
+    match_urls(pairs)
+
+
+def match_urls(pairs):
+    """TSV: status, id, posting|page, normalized url, source. Status is applied, role, company, or new."""
+    urls, index, seen = known_urls(), company_index(), set()
+    for raw, source in pairs:
+        url = normalize_url(raw)
+        if url in seen:
+            continue
+        seen.add(url)
+        kind = "posting" if looks_like_posting(url) else "page"
+        if url in urls:
+            status, ident = urls[url]
+        elif company_token(url) in index:
+            status, ident = "company", index[company_token(url)]
+        else:
+            status, ident = "new", "-"
+        src = source if str(source) == "-" else source.relative_to(ROOT) if source.is_absolute() else source
+        print(f"{status}\t{ident}\t{kind}\t{url}\t{src}")
+
+
+def parse_sets(pairs):
+    extra = {}
+    for pair in pairs:
+        if "=" not in pair:
+            die(f"--set expects key=value, got '{pair}'")
+        k, v = pair.split("=", 1)
+        extra[k] = parse_value(v)
+    return extra
+
+
+def new_company(name, extra, body=""):
+    """Write a company dossier and return its slug; refuse a name or website already on file."""
+    slug = slugify(name)
+    index = company_index()
+    clash = index.get(compact(name)) or (
+        extra.get("website") and index.get(company_token(extra["website"])))
+    if clash or (COMPANIES / slug).exists():
+        die(f"company already exists: {clash or slug}")
+    extra.setdefault("tier", 1)
+    extra.setdefault("score", 0)
+    extra.setdefault("found", today())
+    (COMPANIES / slug).mkdir(parents=True)
+    (COMPANIES / slug / "_index.md").write_text(frontmatter(name, extra) + body)
+    return slug
+
+
+def cmd_add_company(args):
+    extra = parse_sets(args.set)
+    print(new_company(args.name, extra, read_body_from_stdin()))
+
+
+def role_company(name, website):
+    """Slug of the company a role belongs to: an existing slug, a known name or website,
+    or a new company dossier when a website is given."""
+    if name == slugify(name) and (COMPANIES / name / "_index.md").exists():
+        return name
+    index = company_index()
+    found = index.get(compact(name)) or (website and index.get(company_token(website)))
+    if found:
+        return found
+    if not website:
+        die(f"no company '{name}'; pass its name with --website URL to create it")
+    slug = new_company(name, {"website": website})
+    print(f"created company {slug}; screen it with ./jobs shoot {slug} and ./jobs card", file=sys.stderr)
+    return slug
+
+
+def cmd_add_role(args):
+    url = normalize_url(args.url)
+    existing = known_urls().get(url)
+    if existing:
+        die(f"url already known as {existing[0]} {existing[1]}")
+    body = read_body_from_stdin()
+    company = role_company(args.company, args.website)
+    extra = {"url": url, **parse_sets(args.set)}
+    extra.setdefault("found", today())
+    base = slugify(args.title)
+    slug, n = base, 2
+    while (COMPANIES / company / f"{slug}.md").exists():
+        slug, n = f"{base}-{n}", n + 1
+    (COMPANIES / company / f"{slug}.md").write_text(frontmatter(args.title, extra) + body)
+    if args.posting:
+        shutil.copy(args.posting, COMPANIES / company / f"{slug}.posting.txt")
+    print(f"{company}/{slug}")
+
+
+def people():
+    """Yield (id, path, frontmatter) for every person, project, and place."""
+    for p in sorted(PEOPLE.glob("*.md")):
+        if p.name != "_index.md":
+            yield f"people/{p.stem}", p, read_doc(p)[0]
+
+
+def triage_items():
+    """Everything triage labels: companies, roles, then people."""
+    yield from dossiers()
+    yield from people()
+
+
+def cmd_add_person(args):
+    extra = parse_sets(args.set)
+    if extra.get("kind") not in ("person", "project", "place"):
+        die("--set kind=person|project|place is required")
+    slug = slugify(args.name)
+    if (PEOPLE / f"{slug}.md").exists():
+        die(f"already on file: people/{slug}")
+    # The first link is the entry's own page; later ones (a lab, an org) can be shared.
+    own = normalize_url(extra["links"][0]) if extra.get("links") else None
+    for ident, _, fm in people():
+        theirs = fm.get("extra", {}).get("links", [])
+        if own and theirs and normalize_url(theirs[0]) == own:
+            die(f"{own} is already on file as {ident}")
+    body = read_body_from_stdin()
+    extra.setdefault("found", today())
+    PEOPLE.mkdir(exist_ok=True)
+    (PEOPLE / f"{slug}.md").write_text(frontmatter(args.name, extra) + body)
+    print(f"people/{slug}")
+
+
+def cmd_people(args):
+    cols = ["kind", "tier", "areas", "goals", "where", "employer", "company", "triage", "triaged"]
+    print("\t".join(["id", *cols, "title"]))
+    for ident, _, fm in people():
+        extra = fm.get("extra", {})
+        if args.area and args.area not in extra.get("areas", []):
+            continue
+        row = [",".join(extra[c]) if isinstance(extra.get(c), list) else cell(extra.get(c)) for c in cols]
+        print("\t".join([ident, *row, fm.get("title", "")]))
+
+
+def cmd_done(args):
+    dest = INBOX_ARCHIVE / today()
+    for name in args.paths:
+        src = Path(name).resolve()
+        if not src.exists() or not src.is_relative_to(INBOX):
+            die(f"{name} is not in _inbox")
+        dest.mkdir(parents=True, exist_ok=True)
+        target, n = dest / src.name, 2
+        while target.exists():
+            target, n = dest / f"{src.stem}-{n}{src.suffix}", n + 1
+        shutil.move(src, target)
+        print(target.relative_to(ROOT))
+
+
+# Appended after the document stylesheet, so it wins: room to write between the lines.
+SPACED_STYLE = """<style>
+@media print {
+  body { line-height: 2.1; }
+  p, li { margin-top: 9pt; }
+  h2 { margin-top: 16pt; }
+  h3, main > h3 + p { margin-top: 12pt; }
+  .cover-letter > p:not(h1 + p) { line-height: 2.1; margin-top: 14pt; }
+}
+</style>"""
+
+
+def print_pdf(page, out, spaced=False):
+    """Print a built page to PDF. The spaced copy is written beside the original
+    so any relative URL in it still resolves."""
+    if not page.exists():
+        die(f"{page.relative_to(BUILD)} is not in the build; run zola build")
+    src = page
+    if spaced:
+        src = page.with_name("_spaced.html")
+        src.write_text(page.read_text().replace("</head>", SPACED_STYLE + "\n</head>"))
+    try:
+        subprocess.run([CHROME, "--headless", "--disable-gpu", "--no-pdf-header-footer",
+                        f"--print-to-pdf={out}", src.as_uri()],
+                       check=True, capture_output=True)
+    finally:
+        if spaced:
+            src.unlink(missing_ok=True)
+    print(out.relative_to(ROOT) if out.is_relative_to(ROOT) else out)
+
+
+def materials():
+    return sorted(f.stem for f in MATERIALS.glob("*.md") if f.stem != "_index")
+
+
+def cmd_pdf(args):
+    if not Path(CHROME).exists():
+        die(f"Chrome not found at {CHROME}")
+    if not zola_build():
+        die("zola build failed")
+    suffix = "-spaced" if args.spaced else ""
+
+    # A material prints to --out; an application prints into its own folder, where
+    # the file sent has to stay.
+    names = materials() if args.target == "all" else [args.target]
+    if all(n in materials() for n in names):
+        out_dir = Path(args.out).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            print_pdf(BUILD / "materials" / name / "index.html", out_dir / f"{name}{suffix}.pdf",
+                      args.spaced)
+        return
+
+    app_id, d, _ = find_app(args.target)
+    for name in ("resume", "cover-letter"):
+        print_pdf(BUILD / "applications" / app_id / name / "index.html",
+                  d / f"{name}{suffix}.pdf", args.spaced)
+
+
+# ---- postings: every open job at companies on file, from their public job feeds -------
+
+POSTINGS = ROOT / "_postings"  # downloaded feeds, out of git; ./jobs postings rebuilds all of it
+BOARDS = POSTINGS / "boards.tsv"  # the feed each company posts to, so later pulls skip the guessing
+SEARCH_CLI = Path(os.environ.get("SEARCH_CLI", Path.home() / "repos/wasm-static-search/target/release/search-cli"))
+
+FEEDS = {
+    "greenhouse": "https://boards-api.greenhouse.io/v1/boards/{}/jobs?content=true&pay_transparency=true",
+    "ashby": "https://api.ashbyhq.com/posting-api/job-board/{}?includeCompensation=true",
+    "lever": "https://api.lever.co/v0/postings/{}?mode=json",
+    "workable": "https://apply.workable.com/api/v1/widget/accounts/{}?details=true",
+    "recruitee": "https://{}.recruitee.com/api/offers/",
+}
+# A feed's token as it appears in links to its postings.
+FEED_LINKS = [
+    ("greenhouse", re.compile(r"(?:boards|job-boards)(?:-api)?\.greenhouse\.io/(?:embed/job_board\?for=|v1/boards/)?([\w-]+)", re.I)),
+    ("ashby", re.compile(r"jobs\.ashbyhq\.com/([\w.%-]+)", re.I)),
+    ("lever", re.compile(r"jobs\.lever\.co/([\w.-]+)", re.I)),
+    ("workable", re.compile(r"apply\.workable\.com/([\w-]+)", re.I)),
+    ("recruitee", re.compile(r"(?<![\w-])([\w-]{1,64})\.recruitee\.com", re.I)),
+]
+FEED_HOST = {"greenhouse": "greenhouse.io", "ashby": "ashbyhq.com", "lever": "lever.co",
+             "workable": "workable.com", "recruitee": "recruitee.com"}
+NOT_TOKENS = {"embed", "api", "v1", "jobs", "j", "careers", "www"}
+BLOCKS = {"p", "div", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "ul", "ol", "section"}
+_AMOUNT = r"(\d{2,3})(?:,(\d{3})(?:\.\d+)?|(?:\.\d+)?\s?[kK]\b)"
+_TO = r"\s*(?:-|–|—|to|and)\s*"
+# A range's second figure often drops the dollar sign ($150,000-200,000). A figure after A$ or C$ isn't in US dollars.
+DOLLARS = re.compile(rf"(?<![A-Za-z])(?:\$|USD)\s?{_AMOUNT}(?:\s?USD)?(?:{_TO}(?:USD\s?)?\$?\s?{_AMOUNT})?")
+# 185,000 - 200,000 per year, with no dollar sign at all. Another currency's sign or code in front rules it out.
+BARE_RANGE = re.compile(r"(?<![\d,.$€£])(?<![A-Z]{3} )(?<![A-Z]{3})(\d{2,3}),(\d{3})(?:\s?USD)?" + _TO + r"(\d{2,3}),(\d{3})")
+PAY_WORDS = re.compile(r"salar|compensat|\bpay\b|\bwages?\b|earnings|\bOTE\b|per year|annual|\bbase\b|hiring range|"
+                       r"expect to make|ranges?\b", re.I)
+NOT_PAY = re.compile(r"portfolio|\bdeals?\b|revenue|\bARR\b|\bACV\b|funding|\braised?\b|budget|\bspend|contract|"
+                     r"book of|valuation|savings|pipeline|bookings|typical sales|\bin sales\b", re.I)
+NOT_DOLLARS = re.compile(r"\b(CAD|AUD|NZD|SGD|HKD|MXN)\b")
+
+
+class TextOf(HTMLParser):
+    """A posting's HTML as plain paragraphs, list items marked with a bullet."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in BLOCKS:
+            self.out.append("\n• " if tag == "li" else "\n")
+
+    def handle_endtag(self, tag):
+        if tag in BLOCKS:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        self.out.append(data)
+
+
+def paragraphs(markup):
+    for _ in range(3):  # Greenhouse escapes its HTML, sometimes twice
+        if "&lt;" not in markup:
+            break
+        markup = html.unescape(markup)
+    if "<" not in markup:
+        text = markup
+    else:
+        parser = TextOf()
+        parser.feed(markup)
+        text = "".join(parser.out)
+    lines = (re.sub(r"\s+", " ", line).strip() for line in text.split("\n"))
+    return [line for line in lines if line.strip("• ")]
+
+
+def fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (role-matching jobs postings)"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def money(n):
+    return f"${round(n / 1000)}k"
+
+
+def pay_from_text(paras):
+    """The band a posting states. A figure counts near pay wording, or on a short line of its own ("Staff: $181,000-$272,000")."""
+    found = []
+    for para in paras:
+        for pattern, bare in ((DOLLARS, False), (BARE_RANGE, True)):
+            for m in pattern.finditer(para):
+                before, after = para[max(0, m.start() - 150):m.start()], para[m.end():m.end() + 60]
+                worded = PAY_WORDS.search(before) or PAY_WORDS.search(after)
+                if not (worded or (not bare and len(para) < 80)):
+                    continue
+                if NOT_PAY.search(before[-60:]) or NOT_PAY.search(after[:40]) or NOT_DOLLARS.search(before[-5:] + " " + after[:12]):
+                    continue
+                g = m.groups()
+                found += [int(g[i]) * 1000 + int(g[i + 1] or 0) for i in (0, 2) if g[i]]
+    found = [n for n in found if 40_000 <= n <= 900_000]
+    return (min(found), max(found), "USD") if found else (None, None, None)
+
+
+def posting(company, ats, title, location, remote, url, posted, markup, pay=(None, None, None), team=""):
+    lo, hi, currency = pay
+    paras = paragraphs(markup or "")
+    if hi is None:
+        lo, hi, currency = pay_from_text(paras)
+    return {"title": (title or "").strip(), "location": (location or "").strip(), "remote": remote,
+            "url": url, "posted": (posted or "")[:10], "paras": paras, "lo": lo, "hi": hi,
+            "currency": currency or "", "team": team or ""}
+
+
+def read_feed(ats, data):
+    """A feed's postings in one shape, or None when the feed isn't there."""
+    if data is None:
+        return None
+    if ats == "greenhouse":
+        if "jobs" not in data:
+            return None
+        out = []
+        for j in data["jobs"]:
+            ranges = j.get("pay_input_ranges") or []
+            pay = (min(r["min_cents"] for r in ranges) / 100, max(r["max_cents"] for r in ranges) / 100,
+                   ranges[0].get("currency_type")) if ranges else (None, None, None)
+            where = (j.get("location") or {}).get("name", "")
+            out.append(posting("", ats, j.get("title"), where, "remote" in where.lower() or None,
+                               j.get("absolute_url"), j.get("first_published") or j.get("updated_at"),
+                               j.get("content"), pay, ", ".join(d["name"] for d in j.get("departments", []))))
+        return out
+    if ats == "ashby":
+        if "jobs" not in data:
+            return None
+        out = []
+        for j in data["jobs"]:
+            if j.get("isListed") is False:
+                continue
+            salary = [c for c in ((j.get("compensation") or {}).get("summaryComponents") or [])
+                      if c.get("compensationType") == "Salary" and c.get("maxValue")]
+            pay = (salary[0].get("minValue"), salary[0]["maxValue"], salary[0].get("currencyCode")) if salary else (None, None, None)
+            where = j.get("location", "")
+            remote = j.get("isRemote") or (j.get("workplaceType") or "").lower() == "remote" or None
+            out.append(posting("", ats, j.get("title"), where, remote, j.get("jobUrl"), j.get("publishedAt"),
+                               j.get("descriptionHtml") or j.get("descriptionPlain"), pay, j.get("department", "")))
+        return out
+    if ats == "lever":
+        if not isinstance(data, list):
+            return None
+        out = []
+        for j in data:
+            cats = j.get("categories") or {}
+            s = j.get("salaryRange") or {}
+            pay = (s.get("min"), s["max"], s.get("currency")) if s.get("max") and s.get("interval", "per-year-salary") == "per-year-salary" else (None, None, None)
+            body = j.get("description", "") + "".join(f"<h3>{x.get('text', '')}</h3><ul>{x.get('content', '')}</ul>"
+                                                     for x in j.get("lists", [])) + j.get("additional", "")
+            created = datetime.date.fromtimestamp(j["createdAt"] / 1000).isoformat() if j.get("createdAt") else ""
+            where = cats.get("location", "")
+            remote = (j.get("workplaceType") == "remote") or "remote" in where.lower() or None
+            out.append(posting("", ats, j.get("text"), where, remote, j.get("hostedUrl"), created, body, pay,
+                               cats.get("team", "")))
+        return out
+    if ats == "workable":
+        if "jobs" not in data:
+            return None
+        return [posting("", ats, j.get("title"), ", ".join(filter(None, (j.get("city"), j.get("state"), j.get("country")))),
+                        j.get("telecommuting") or None, j.get("url") or j.get("application_url"), j.get("published_on"),
+                        j.get("description"), team=j.get("department", "")) for j in data["jobs"]]
+    if ats == "recruitee":
+        if "offers" not in data:
+            return None
+        out = []
+        for j in data["offers"]:
+            s = j.get("salary") or {}
+            pay = (float(s["min"]) if s.get("min") else None, float(s["max"]), s.get("currency")) if s.get("max") and s.get("period", "year") == "year" else (None, None, None)
+            out.append(posting("", ats, j.get("title"), j.get("location"), j.get("remote") or None, j.get("careers_url"),
+                               j.get("published_at"), (j.get("description") or "") + (j.get("requirements") or ""),
+                               pay, j.get("department", "")))
+        return out
+
+
+def feed_tokens(text):
+    """Every (feed, token) a page's text links to."""
+    found = []
+    lower = text.lower()
+    for ats, pattern in FEED_LINKS:
+        if FEED_HOST[ats] not in lower:  # a page without the host skips the regex, which is slow on big pages
+            continue
+        for token in pattern.findall(text):
+            token = urllib.parse.unquote(token).strip(".")
+            if token.lower() not in NOT_TOKENS and (ats, token) not in found:
+                found.append((ats, token))
+    return found
+
+
+def board_guesses(slug, fm, known):
+    """Feeds and tokens to try: links on file first, then tokens made from the company's names."""
+    extra = fm.get("extra", {})
+    linked = list(known.get(slug, []))
+    host_root = urllib.parse.urlsplit(extra.get("website", "")).netloc.lower().removeprefix("www.").split(".")[0]
+    names = [slug, slug.replace("-", ""), host_root, compact(fm["title"]), *extra.get("aliases", [])]
+    guessed = []
+    for name in names:
+        name = name.lower().strip()
+        if name and name not in guessed:
+            guessed.append(name)
+    return linked, [(ats, name) for name in guessed for ats in FEEDS]
+
+
+def names_company(fm, jobs, board_name=""):
+    """Whether a guessed feed belongs to this company: its whole name or its domain shows up in the postings.
+    A shorter test let a feed named "guild" or "make" pass for unrelated companies."""
+    text = board_name + " " + " ".join(" ".join(j["paras"][:40]) for j in jobs[:6])
+    host = urllib.parse.urlsplit(fm["extra"].get("website", "")).netloc.lower().removeprefix("www.")
+    return compact(fm["title"]) in compact(text) or bool(host) and host in text.lower()
+
+
+def find_board(slug, fm, known):
+    linked, guessed = board_guesses(slug, fm, known)
+    for ats, token in linked:
+        jobs = read_feed(ats, fetch_json(FEEDS[ats].format(token)))
+        if jobs is not None:
+            return ats, token, "linked", jobs
+    for ats, token in guessed:
+        jobs = read_feed(ats, fetch_json(FEEDS[ats].format(token)))
+        if not jobs:
+            continue
+        board = (fetch_json(f"https://boards-api.greenhouse.io/v1/boards/{token}") or {}).get("name", "") if ats == "greenhouse" else ""
+        if names_company(fm, jobs, board):
+            return ats, token, "guessed", jobs
+    return "-", "-", "none", []
+
+
+def linked_boards():
+    """Feed tokens from links on file: role URLs, company websites, and captured homepages."""
+    known = {}
+    for slug, d in companies():
+        fm = read_doc(d / "_index.md")[0]
+        text = fm.get("extra", {}).get("website", "")
+        for p in d.glob("*.md"):
+            if p.name != "_index.md":
+                text += " " + read_doc(p)[0].get("extra", {}).get("url", "")
+        known[slug] = feed_tokens(text)
+    index = capture_index()
+    for slug, d in companies():
+        site = read_doc(d / "_index.md")[0].get("extra", {}).get("website")
+        cap = index.get(normalize_url(site)) if site else None
+        if cap and (cap / "page.html").exists():
+            for found in feed_tokens((cap / "page.html").read_text(errors="replace")):
+                if found not in known[slug]:
+                    known[slug].append(found)
+    return known
+
+
+def read_boards():
+    if not BOARDS.exists():
+        return {}
+    rows = [line.split("\t") for line in BOARDS.read_text().splitlines()[1:] if line]
+    return {r[0]: r[1:] for r in rows}
+
+
+def tsv_cell(text):
+    return str(text).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def tags(job, label):
+    words = []
+    if job["remote"]:
+        words.append("remote")
+    if job["hi"] and job["currency"] in ("USD", ""):
+        words += [f"{k}k" for k in range(100, 301, 10) if job["hi"] >= k * 1000]
+    if not job["hi"]:
+        words.append("nopay")
+    if label in ("Y", "y"):
+        words.append("yes")
+    return " ".join(words)
+
+
+def chunks(paras, words=100):
+    """Paragraphs joined into runs of about this many words; a record per paragraph made a 200 MB index."""
+    out, run = [], []
+    for para in paras:
+        run.append(para)
+        if sum(len(p.split()) for p in run) >= words:
+            out.append(" ¶ ".join(run))
+            run = []
+    if run:
+        out.append(" ¶ ".join(run))
+    return out
+
+
+def write_postings(found):
+    """postings.tsv, one line per posting, and records.tsv for the search engine, one line per paragraph."""
+    refs = set()
+    rows, records = [], []
+    everywhere = Counter(para for *_, jobs in found for job in jobs for para in set(job["paras"]))
+    for slug, company, label, ats, jobs in found:
+        # A paragraph in three of a company's postings, or in 20 anywhere, is its about-us, benefits, or legal text.
+        theirs = Counter(para for job in jobs for para in set(job["paras"]))
+        for job in jobs:
+            job["paras"] = [para for para in job["paras"]
+                            if (theirs[para] < 3 or len(jobs) < 3) and everywhere[para] < 20]
+        for job in jobs:
+            name = f"{company} · {job['title']}"
+            for extra in (job["location"], job["url"]):
+                if name not in refs:
+                    break
+                name = f"{name} ({extra})"
+            refs.add(name)
+            pay = ""
+            if job["hi"]:
+                pay = f"{money(job['lo'])}-{money(job['hi'])}" if job["lo"] and job["lo"] != job["hi"] else money(job["hi"])
+                pay += "" if job["currency"] in ("USD", "") else f" {job['currency']}"
+            is_ = tags(job, label)
+            rows.append([slug, label, ats, job["title"], job["location"], "remote" if job["remote"] else "", pay,
+                         job["posted"], job["url"], " \\n ".join(job["paras"])])
+            head = ". ".join(filter(None, (job["title"], company, job["team"], job["location"], pay)))
+            fields = [company, job["location"], pay, label if label != "-" else "", job["posted"], is_, job["url"]]
+            for i, text in enumerate([head, *chunks(job["paras"])], 1):
+                records.append([f"{name} {i}", text, *fields])
+    POSTINGS.mkdir(exist_ok=True)
+    with (POSTINGS / "postings.tsv").open("w") as f:
+        f.write("company\tlabel\tfeed\ttitle\tlocation\tremote\tpay\tposted\turl\ttext\n")
+        for row in rows:
+            f.write("\t".join(tsv_cell(c) if i < 9 else c.replace("\t", " ") for i, c in enumerate(row)) + "\n")
+    with (POSTINGS / "records.tsv").open("w") as f:
+        f.write("#ref\ttext\tcompany\tlocation\tpay\tlabel\tposted\tis\tlink\n")
+        for row in records:
+            f.write("\t".join(tsv_cell(c) for c in row) + "\n")
+    return len(rows), len(records)
+
+
+def build_site():
+    if not SEARCH_CLI.exists():
+        print(f"jobs: no search page built; {SEARCH_CLI} isn't there (SEARCH_CLI names another)", file=sys.stderr)
+        return
+    index = POSTINGS / "index.bin"
+    with index.open("wb") as out:
+        subprocess.run([str(SEARCH_CLI), "index", str(POSTINGS / "records.tsv")], stdout=out, check=True)
+    site = POSTINGS / "site"
+    shutil.rmtree(site, ignore_errors=True)
+    subprocess.run([str(SEARCH_CLI), "bundle", str(index), "-o", str(site), "--name", "Jobs",
+                    "--about", "Every open posting at the companies on file. is:remote, is:150k, label:y and in:company narrow it."],
+                   check=True, stdout=subprocess.DEVNULL)
+    print(f"jobs: search page in {site.relative_to(ROOT)}; serve it with: ./jobs postings --serve", file=sys.stderr)
+
+
+def cmd_postings(args):
+    if args.serve:
+        site = POSTINGS / "site"
+        if not site.exists():
+            die("no search page yet; run ./jobs postings first")
+        handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=str(site), **k)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+        url = f"http://127.0.0.1:{args.port}/"
+        print(f"jobs: serving {url}", file=sys.stderr)
+        webbrowser.open(url)
+        server.serve_forever()
+    boards = {} if args.reprobe else read_boards()
+    known = linked_boards()
+    targets = []
+    for slug, d in companies():
+        fm = read_doc(d / "_index.md")[0]
+        label = fm.get("extra", {}).get("triage", "-")
+        if label != "n":
+            targets.append((slug, fm, label))
+
+    def pull(target):
+        slug, fm, label = target
+        if slug in boards and boards[slug][0] != "-":
+            ats, token, how = boards[slug][:3]
+            jobs = read_feed(ats, fetch_json(FEEDS[ats].format(token)))
+            if jobs is not None:
+                return slug, fm["title"], label, ats, token, how, jobs
+        if slug in boards and boards[slug][0] == "-" and not args.probe:
+            return slug, fm["title"], label, "-", "-", "none", []
+        return slug, fm["title"], label, *find_board(slug, fm, known)
+
+    with ThreadPoolExecutor(args.threads) as pool:
+        results = list(pool.map(pull, targets))
+    POSTINGS.mkdir(exist_ok=True)
+    with BOARDS.open("w") as f:
+        f.write("company\tfeed\ttoken\thow\tchecked\n")
+        for slug, _, _, ats, token, how, _ in results:
+            f.write(f"{slug}\t{ats}\t{token}\t{how}\t{today()}\n")
+    found = [(slug, company, label, ats, jobs) for slug, company, label, ats, _, _, jobs in results if jobs]
+    count, records = write_postings(found)
+    feeds = {}
+    for _, _, _, ats, *_ in results:
+        feeds[ats] = feeds.get(ats, 0) + 1
+    print(f"jobs: {len(targets)} companies, {sum(v for k, v in feeds.items() if k != '-')} with a feed "
+          f"({', '.join(f'{k} {v}' for k, v in sorted(feeds.items()) if k != '-')}), "
+          f"{count} postings, {records} records", file=sys.stderr)
+    if not args.no_site:
+        build_site()
+
+
+def main():
+    p = argparse.ArgumentParser(prog="jobs", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve", help="live-reload site for editing resumes and letters")
+    s.add_argument("--port", type=int, default=1111)
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("triage", help="keyboard triage of company and role dossiers")
+    s.add_argument("--port", type=int, default=1112)
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(fn=cmd_triage)
+
+    s = sub.add_parser("apply", help="start an application folder for a role")
+    s.add_argument("role", help="role id, e.g. quillwork/support-operations-engineer")
+    s.add_argument("--force", action="store_true", help="allow a second application to the same role")
+    s.add_argument("--resume", default="resume.md", metavar="FILE",
+                   help="which resume in content/materials/ to snapshot (default: resume.md)")
+    s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser("set", help="set or clear pipeline fields in a dossier's frontmatter")
+    s.add_argument("id", help="company slug or company/role")
+    s.add_argument("fields", nargs="+", metavar="FIELD[=VALUE]",
+                   help=f"one of: {' '.join(STATE)}. triage=y, review=apply, and outcome=rejected stamp "
+                        "their time; a bare time field (applied) or flag (content) stamps now or sets it; "
+                        "applied=2026-09-20 sets a past date; FIELD= clears")
+    s.set_defaults(fn=cmd_set)
+
+    s = sub.add_parser("status", help="applications and their company's latest stage (TSV)")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("list", help="dossiers and their pipeline fields, - when empty (TSV with a header)")
+    s.add_argument("--kind", choices=["all", "company", "role"], default="all")
+    s.add_argument("--label", choices=[*LABELS, ""], help="Y dream fit, y yes, m maybe, w follow, n no, '' unlabeled")
+    s.add_argument("--flag", choices=sorted(FLAGS), help="only dossiers with this flag on")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("note", help="add the user's note to a company or role, e.g. why it got its label")
+    s.add_argument("id", help="company slug or company/role")
+    s.add_argument("text", nargs="*", help="note text; or pass it on stdin")
+    s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("notes", help="notes with current labels (TSV); an id limits to that company and its roles")
+    s.add_argument("id", nargs="?")
+    s.set_defaults(fn=cmd_notes)
+
+    s = sub.add_parser("shoot", help="screenshot company websites on the phone, for the triage card")
+    s.add_argument("ids", nargs="*", help="company slugs; default is every company without a screenshot")
+    s.add_argument("--issues", action="store_true", help="retake the ones flagged issue in triage")
+    s.add_argument("--errors", action="store_true", help="retry the ones whose site never loaded")
+    s.add_argument("--again", action="store_true", help="retake screenshots that already exist")
+    s.add_argument("--limit", type=int, metavar="N", help="stop after N companies")
+    s.set_defaults(fn=cmd_shoot)
+
+    s = sub.add_parser("reprocess", help="re-read the site's words from captures on disk (no phone)")
+    s.set_defaults(fn=cmd_reprocess)
+
+    s = sub.add_parser("evidence", help="what the phone saw for each company (default: captured, unscreened)")
+    s.add_argument("ids", nargs="*", help="company slugs")
+    s.add_argument("--chars", type=int, default=1500, help="how much page text to print (default 1500)")
+    s.set_defaults(fn=cmd_evidence)
+
+    s = sub.add_parser("card", help="screen a company and rewrite its card; body on stdin")
+    s.add_argument("id", help="company slug")
+    s.add_argument("--screen", required=True, choices=["PASS", "HOLD", "FAIL"])
+    s.add_argument("--confidence", choices=["low", "medium", "high"])
+    s.add_argument("--location", help="as the site states it")
+    s.set_defaults(fn=cmd_card)
+
+    s = sub.add_parser("check", help="find duplicate roles/applications and broken links")
+    s.set_defaults(fn=cmd_check)
+
+    s = sub.add_parser("inbox", help="list _inbox files and classify the URLs in them (TSV)")
+    s.set_defaults(fn=cmd_inbox)
+
+    s = sub.add_parser("grab", help="save the front browser window's tabs (and page text) into _inbox")
+    s.add_argument("--intent", choices=["research", "apply"], default="research")
+    s.add_argument("--browser", help=f"one of: {', '.join(BROWSERS)}; default is the frontmost or first running")
+    s.add_argument("--no-text", action="store_true", help="URLs and titles only")
+    s.add_argument("--go", action="store_true", help="then start Claude on the inbox in a terminal and open Zed")
+    s.set_defaults(fn=cmd_grab)
+
+    s = sub.add_parser("match", help="classify URLs from files or stdin as applied, role, company, or new (TSV)")
+    s.add_argument("files", nargs="*")
+    s.set_defaults(fn=cmd_match)
+
+    s = sub.add_parser("add-company", help="create a company dossier; body on stdin; prints the slug")
+    s.add_argument("name")
+    s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="extra frontmatter, repeatable")
+    s.set_defaults(fn=cmd_add_company)
+
+    s = sub.add_parser("add-role", help="create a role dossier, and its company if new; body on stdin; prints the role id")
+    s.add_argument("company", help="company slug or name; a new name needs --website")
+    s.add_argument("title")
+    s.add_argument("url")
+    s.add_argument("--website", metavar="URL", help="the company's homepage; creates the company when it isn't on file")
+    s.add_argument("--posting", metavar="FILE", help="full posting text, kept beside the dossier")
+    s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="extra frontmatter, repeatable")
+    s.set_defaults(fn=cmd_add_role)
+
+    s = sub.add_parser("add-person", help="create a person, project, or place entry; body on stdin; prints the id")
+    s.add_argument("name")
+    s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="frontmatter, repeatable; kind=person|project|place is required")
+    s.set_defaults(fn=cmd_add_person)
+
+    s = sub.add_parser("people", help="people, projects, and places on file (TSV with a header)")
+    s.add_argument("--area", help="an area id from brief/04-people.md")
+    s.set_defaults(fn=cmd_people)
+
+    s = sub.add_parser("done", help="move processed _inbox files into archive/inbox/<date>/")
+    s.add_argument("paths", nargs="+")
+    s.set_defaults(fn=cmd_done)
+
+    s = sub.add_parser("pdf", help="print an application, or a material, to PDF")
+    s.add_argument("target", help="an application id, a name from content/materials/, or 'all' for every material")
+    s.add_argument("--spaced", action="store_true",
+                   help="double leading, for editing by hand between the lines")
+    s.add_argument("--out", default="~/Desktop", help="where material PDFs land (default: ~/Desktop)")
+    s.set_defaults(fn=cmd_pdf)
+
+    s = sub.add_parser("postings", help="pull every open posting at companies not labelled n into _postings/, "
+                                        "and build a search page over them")
+    s.add_argument("--probe", action="store_true", help="look again for a feed at companies that had none")
+    s.add_argument("--reprobe", action="store_true", help="forget every feed found and look again")
+    s.add_argument("--threads", type=int, default=16)
+    s.add_argument("--no-site", action="store_true", help="skip building the search page")
+    s.add_argument("--serve", action="store_true", help="serve the search page built last and open it")
+    s.add_argument("--port", type=int, default=8763)
+    s.set_defaults(fn=cmd_postings)
+
+    if len(sys.argv) == 1:
+        p.print_help()
+        sys.exit(0)
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

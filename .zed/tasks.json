@@ -1,0 +1,21 @@
+[
+  {
+    "label": "Go",
+    "command": "claude \"Process the inbox\"",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Triage",
+    "command": "./jobs triage",
+    "use_new_terminal": true,
+    "reveal": "always"
+  },
+  {
+    "label": "Serve",
+    "command": "./jobs serve",
+    "use_new_terminal": true,
+    "reveal": "always"
+  }
+]

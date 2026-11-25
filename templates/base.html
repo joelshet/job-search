@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ config.title }}{% endblock %}</title>
+<link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+</head>
+<body class="{% block body_class %}{% endblock %}">
+<nav>
+  <a href="{{ get_url(path='@/_index.md') }}">Home</a>
+  <a href="{{ get_url(path='@/triage.md') }}">Triage</a>
+  <a href="{{ get_url(path='@/companies/_index.md') }}">Companies</a>
+  <a href="{{ get_url(path='@/applications/_index.md') }}">Applications</a>
+  <a href="{{ get_url(path='@/materials/_index.md') }}">Materials</a>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block body_class %}home{% endblock %}
+{% block content %}
+{# With no companies the lists below have nothing to index. #}
+{% set none_yet = get_section(path="companies/_index.md") %}
+{% if not none_yet.subsections %}
+<h1>No companies yet</h1>
+<p>Drop links or postings in <code>_inbox/</code> and tell Claude “process the inbox”, or ask it for a research round.</p>
+{% else %}
+{% set triage = get_url(path="@/triage.md") %}
+{% set today = now() | date(format="%Y-%m-%d") %}
+{% set apps_root = get_section(path="applications/_index.md") %}
+{% set apps = [get_section(path=path) for path in apps_root.subsections] %}
+{% set app_roles = [a.extra.role | default(value="") for a in apps] %}
+{% set app_companies = [get_section(path="companies/" ~ a.extra.company ~ "/_index.md") for a in apps] %}
+
+{# Tera can't nest arrays or append in a loop, so every dossier is an index into parallel lists:
+   companies first (0 to nc, those with roles ahead), then roles, both in score order. Role ids contain a slash. #}
+{% set companies_root = get_section(path="companies/_index.md") %}
+{% set sections = [get_section(path=path) for path in companies_root.subsections] | sort(attribute="extra.score") | reverse %}
+{% set nc = sections | length %}
+{# Companies with roles come first, so every group lists them above the rest. #}
+{% set staffed = [c.components | last for c in sections if c.pages] | join(sep="\n") %}
+{% set unstaffed = [c.components | last for c in sections if not c.pages] | join(sep="\n") %}
+{% set company_ids = [s for s in [staffed, unstaffed] if s] | join(sep="\n") %}
+{% set role_ids = [[(c.components | last) ~ "/" ~ p.slug for p in c.pages] | join(sep="\n") for c in sections if c.pages] | join(sep="\n") %}
+{% set ids = (company_ids ~ "\n" ~ role_ids if role_ids else company_ids) | split(pat="\n") %}
+{% set n = ids | length %}
+{% set dossiers = [get_page(path="companies/" ~ id ~ ".md") if "/" in id else get_section(path="companies/" ~ id ~ "/_index.md") for id in ids] %}
+{% set labels = [d.extra.triage | default(value="") for d in dossiers] %}
+{% set flags = ["1" if d.extra.content else "" for d in dossiers] %}
+{% set screens = [d.extra.screen | default(value="") for d in dossiers] %}
+{% set buckets = [labels[i] or ("FAIL" if screens[i] == "FAIL" else "todo") for i in range(end=n)] %}
+{# owners[i]: index of dossier i's company (a company owns itself). #}
+{% set owners = [i if i < nc else ([j for j in range(end=nc) if ids[j] == (ids[i] | split(pat="/") | first)] | first) for i in range(end=n)] %}
+{% set parents = [labels[owners[i]] for i in range(end=n)] %}
+
+{% set count_dream = [i for i in range(end=nc) if buckets[i] == "Y"] | length %}
+{% set count_yes = [i for i in range(end=nc) if buckets[i] == "y"] | length %}
+{% set count_maybe = [i for i in range(end=nc) if buckets[i] == "m"] | length %}
+{% set count_follow = [i for i in range(end=nc) if buckets[i] == "w"] | length %}
+{% set count_no = [i for i in range(end=nc) if buckets[i] == "n"] | length %}
+{% set count_todo = [i for i in range(end=nc) if buckets[i] == "todo"] | length %}
+{% set count_out = [i for i in range(end=nc) if buckets[i] == "FAIL"] | length %}
+{% set triaged = nc - count_todo - count_out %}
+{% set labelled_today = [d for d in dossiers if d.extra.triaged and d.extra.triaged is starting_with(pat=today)] | length %}
+
+{# Same rules as triage's role to-do list. #}
+{% set ready_dream = [i for i in range(start=nc, end=n) if labels[i] == "Y" and ids[i] not in app_roles] %}
+{% set ready_yes = [i for i in range(start=nc, end=n) if labels[i] == "y" and ids[i] not in app_roles] %}
+{% set roles_todo = [i for i in range(start=nc, end=n) if not labels[i] and screens[i] != "FAIL" and parents[i] != "n"] | length %}
+{% set applied = [c for c in app_companies if c.extra.applied or c.extra.first_call or c.extra.interview or c.extra.offer or c.extra.outcome == "accepted"] | length %}
+{% set interviewing = [c for c in app_companies if c.extra.first_call or c.extra.interview or c.extra.offer or c.extra.outcome == "accepted"] | length %}
+{% set offers = [c for c in app_companies if c.extra.offer or c.extra.outcome == "accepted"] | length %}
+
+<h1 class="progress-title"><span class="big">{{ triaged }}</span> of {{ nc }} companies triaged</h1>
+<p class="progress" role="img" aria-label="{{ triaged }} of {{ nc }} companies triaged"><span style="width: {{ triaged / nc * 100 }}%"></span></p>
+<p class="tally">{% for s in [["dream", "Dream fit", count_dream, "Y"], ["yes", "Yes", count_yes, "y"], ["maybe", "Maybe", count_maybe, "m"], ["follow", "Follow", count_follow, "w"], ["no", "No", count_no, "n"], ["todo", "To do", count_todo, ""], ["out", "Screened out", count_out, ""]] %}<a href="#{{ s[0] }}" data-label="{{ s[3] }}">{{ s[1] }}</a> {{ s[2] }}{% if not loop.last %} · {% endif %}{% endfor %}{% if labelled_today %}<br>{{ labelled_today }} labels today{% endif %}</p>
+
+<h2>Next</h2>
+{% set first = (ready_dream | first) if ready_dream else ((ready_yes | first) if ready_yes else none) %}
+{% if first is not none %}{% set company = get_section(path="companies/" ~ (ids[first] | split(pat="/") | first) ~ "/_index.md") %}
+<p class="next"><strong>Apply to {{ company.title }}: {{ dossiers[first].title }}.</strong> {{ dossiers[first].content | split(pat="</p>") | first | striptags }}</p>
+<p class="facts">Tell Claude “apply to {{ company.title }}”, or run <code>./jobs apply {{ ids[first] }}</code><br><a href="{{ triage }}#{{ ids[first] }}">Read the card</a>{% if dossiers[first].extra.url %} · <a href="{{ dossiers[first].extra.url }}">Posting</a>{% endif %}</p>
+{% elif roles_todo %}
+<p class="next"><strong><a href="{{ triage }}">Triage {{ roles_todo }} role{{ "s" if roles_todo != 1 else "" }}.</a></strong> Press <kbd>tab</kbd> in triage for role mode.</p>
+{% else %}
+<p class="next"><strong><a href="{{ triage }}">Triage {{ count_todo }} companies.</a></strong></p>
+{% endif %}
+{% set more = (ready_dream | length) + (ready_yes | length) - (1 if first is not none else 0) %}
+<ul>
+  {% if more %}<li><a href="#dream">{{ more }} more liked role{{ "s" if more != 1 else "" }} to apply to</a></li>{% endif %}
+  {% if first is not none and roles_todo %}<li><a href="{{ triage }}">{{ roles_todo }} role{{ "s" if roles_todo != 1 else "" }} to triage</a> (<kbd>tab</kbd> for role mode)</li>{% endif %}
+  {% if (first is not none or roles_todo) and count_todo %}<li><a href="{{ triage }}">{{ count_todo }} companies to triage</a></li>{% endif %}
+  <li>Labels save the moment you press a key, so stopping mid-deck loses nothing.</li>
+</ul>
+
+<h2>Pipeline</h2>
+<table class="pipeline">
+<thead><tr><th>Researched</th><th>Triaged</th><th>Want to work there</th><th>Roles on file</th><th>Applied</th><th>Interviewing</th><th>Offers</th></tr></thead>
+<tbody><tr><td>{{ nc }}</td><td>{{ triaged }}</td><td>{{ count_dream + count_yes }}</td><td>{{ n - nc }}</td><td>{{ applied }}</td><td>{{ interviewing }}</td><td>{{ offers }}</td></tr></tbody>
+</table>
+
+{# Groups follow the company's label. Each company lists its roles, whatever their own labels,
+   and a content flag on a role puts its company in Content ideas. #}
+{% set content_owners = [owners[i] for i in range(end=n) if flags[i]] %}
+{% set content = ["1" if i in content_owners else "" for i in range(end=nc)] %}
+{% for g in [["dream", "Dream fit", "Y", "table"], ["yes", "Yes", "y", "table"], ["maybe", "Maybe", "m", "names"], ["follow", "Follow", "w", "names"], ["content", "Content ideas", "1", "names"], ["no", "No", "n", "closed"], ["todo", "To do", "todo", "closed"], ["out", "Screened out", "FAIL", "closed"]] %}
+{% set values = content if g[0] == "content" else buckets %}
+{% set members = [i for i in range(end=nc) if values[i] == g[2]] %}
+{% set cs = members | length %}
+{% set rs = [i for i in range(start=nc, end=n) if owners[i] in members] | length %}
+<details id="{{ g[0] }}" class="group"{% if g[3] != "closed" %} open{% endif %}>
+<summary><h2>{{ g[1] }}</h2> <small>{{ cs }} {{ "company" if cs == 1 else "companies" }}{% if rs %}, {{ rs }} role{{ "s" if rs != 1 else "" }}{% endif %}</small></summary>
+{% if not members %}<p><small>None yet.</small></p>
+{% elif g[3] == "table" %}
+<table>
+<thead><tr><th>Name</th><th>Score</th><th>Why</th></tr></thead>
+<tbody>
+{% for i in members %}
+<tr><td><a href="{{ triage }}#{{ ids[i] }}">{{ dossiers[i].title }}</a></td><td>{{ dossiers[i].extra.score if dossiers[i].extra.score else "" }}</td><td>{{ dossiers[i].content | split(pat="</p>") | first | striptags | truncate(length=160) }}</td></tr>
+{% for p in dossiers[i].pages %}
+<tr class="role"><td><a href="{{ triage }}#{{ ids[i] }}/{{ p.slug }}">{{ p.title }}</a> {{<role_label label={p.extra.triage | default(value="")} />}}</td><td>{{ p.extra.score if p.extra.score else "" }}</td><td>{{ p.content | split(pat="</p>") | first | striptags | truncate(length=160) }}</td></tr>
+{% endfor %}
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="names">{% for i in members %}<a href="{{ triage }}#{{ ids[i] }}">{{ dossiers[i].title }}</a>{% if dossiers[i].pages %} ({% for p in dossiers[i].pages %}<a href="{{ triage }}#{{ ids[i] }}/{{ p.slug }}">{{ p.title }}</a> {{<role_label label={p.extra.triage | default(value="")} />}}{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+{% endif %}
+</details>
+{% endfor %}
+
+{% if apps %}
+<h2>Applications</h2>
+<table>
+<thead><tr><th>Application</th><th>State</th></tr></thead>
+<tbody>
+{% for a in apps | reverse %}
+<tr><td><a href="{{ a.permalink }}">{{ a.title }}</a></td><td>{{<app_state company={a.extra.company} />}}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endif %}
+{% endblock %}

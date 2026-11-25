@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Triage{% endblock %}
+{% block body_class %}triage{% endblock %}
+{% block content %}
+{% set companies = get_section(path="companies/_index.md") %}
+<p id="mode"></p>
+<div id="deck">
+{% for path in companies.subsections %}{% set c = get_section(path=path) %}{% set slug = c.components | last %}
+  <article class="card" hidden data-id="{{ slug }}" data-kind="company" data-name="{{ c.title }}"
+    data-tier="{{ c.extra.tier | default(value=0) }}" data-score="{{ c.extra.score | default(value=0) }}"
+    data-screen="{{ c.extra.screen | default(value='') }}" data-url="{{ c.extra.website | default(value='') }}">
+    <header>
+      <h1>{{ c.title }} <span class="marks"></span></h1>
+      {{<card_facts extra={c.extra} />}}
+      {{<profiles extra={c.extra} />}}
+      {% if c.pages %}<p class="roles">Roles on file: {% for p in c.pages %}{{ p.title }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+      <ul class="notes"></ul>
+    </header>
+    {% for a in c.assets %}{% if "site.jpg" in a %}<img class="shot" src="{{ a }}" alt="" loading="lazy">{% endif %}{% endfor %}
+    {# The authored line first, then the site in its own words, then whatever else the dossier says. #}
+    {% set told = c.content | split(pat="</p>") %}
+    <div class="lead">{{ told[0] | safe }}{% if told | length > 1 %}</p>{% endif %}</div>
+    {{<says extra={c.extra} />}}
+    {# Case against stays; scores, evidence and the research notes are on the company page. #}
+    {% set rest = told[1:] | join(sep="</p>") | split(pat='<h2 id="scores"') | first
+                | split(pat='<h2 id="evidence"') | first | split(pat='<h2 id="run-002-screen"') | first
+                | split(pat='<h2 id="interview-process') | first | split(pat='<h2 id="next-action"') | first %}
+    {% if rest | trim %}<div class="body">{{ rest | safe }}</div>{% endif %}
+  </article>
+  {% for p in c.pages %}
+  <article class="card" hidden data-id="{{ slug }}/{{ p.slug }}" data-kind="role" data-company="{{ slug }}" data-name="{{ c.title }} {{ p.title }}"
+    data-found="{{ p.extra.found | default(value='') }}" data-score="{{ p.extra.score | default(value=0) }}"
+    data-screen="{{ p.extra.screen | default(value='') }}" data-url="{{ p.extra.url | default(value='') }}">
+    <header>
+      <p class="company">at {{ c.title }} · <span class="company-label"></span></p>
+      <h1>{{ p.title }} <span class="marks"></span></h1>
+      {{<card_facts extra={p.extra} />}}
+      <ul class="notes"></ul>
+    </header>
+    <div class="body">{{ p.content | safe }}</div>
+  </article>
+  {% endfor %}
+{% endfor %}
+{% set people = get_section(path="people/_index.md") %}
+{% for p in people.pages %}
+  <article class="card" hidden data-id="people/{{ p.slug }}" data-kind="person" data-name="{{ p.title }}"
+    data-found="{{ p.extra.found | default(value='') }}" data-url="{{ p.extra.links | default(value=['']) | first }}">
+    <header>
+      <p class="company">{{ p.extra.kind }} · {{ p.extra.areas | default(value=[]) | join(sep=", ") }} · for {{ p.extra.goals | default(value=[]) | join(sep=", ") }}</p>
+      <h1>{{ p.title }} <span class="marks"></span></h1>
+      <p class="facts">{{ p.extra.where | default(value="") }}{% if p.extra.employer and p.extra.employer != "-" %} · {{ p.extra.employer }}{% endif %}{% if p.extra.company %} · dossier <code>{{ p.extra.company }}</code>{% endif %}</p>
+      <ul class="notes"></ul>
+    </header>
+    {# First paragraph and "Why them" on the card; evidence stays on the page. #}
+    {% set told = p.content | split(pat='<h2 id="evidence"') | first %}
+    <div class="body">{{ told | safe }}</div>
+  </article>
+{% endfor %}
+</div>
+<p id="empty" hidden>Nothing left here. <kbd>tab</kbd> switches mode, <kbd>f</kbd> changes the filter.</p>
+
+<footer id="bar">
+  <form id="note" hidden>
+    <label for="note-text">Note on <span id="note-target"></span></label>
+    <input id="note-text" autocomplete="off" placeholder="why, or what the dossier got wrong. enter saves, esc cancels">
+  </form>
+  <span id="pos"></span>
+  <span id="view"></span>
+  <span class="keys">Y dream  y yes  m maybe  w follow  n no  c content  i shot issue  enter note  u undo  j/k move  tab mode  ? help</span>
+</footer>
+
+<dialog id="help">
+  <table>
+    <tr><td><kbd>tab</kbd></td><td>Cycle between company, role, and people triage</td></tr>
+    <tr><td><kbd>Y</kbd></td><td>Dream fit: one step below driving there to introduce yourself</td></tr>
+    <tr><td><kbd>y</kbd> <kbd>m</kbd> <kbd>n</kbd></td><td>Label yes, maybe, no, and move on</td></tr>
+    <tr><td><kbd>w</kbd></td><td>Follow: cool, worth watching, probably not one to apply to</td></tr>
+    <tr><td><kbd>c</kbd></td><td>Toggle content idea: worth a video or demo project. Works alongside any label and stays on the card.</td></tr>
+    <tr><td><kbd>i</kbd></td><td>Flag the screenshot: it shows a cookie banner, a bot check, or a half-loaded page instead of the site. Moves on; <code>./jobs shoot --issues</code> retakes it.</td></tr>
+    <tr><td><kbd>x</kbd></td><td>Clear the label</td></tr>
+    <tr><td><kbd>enter</kbd></td><td>Write a note. Right after a label it goes on the card you just labelled; otherwise on the card in view. Research agents read these.</td></tr>
+    <tr><td><kbd>u</kbd></td><td>Undo the last label</td></tr>
+    <tr><td><kbd>j</kbd> <kbd>→</kbd> / <kbd>k</kbd> <kbd>←</kbd></td><td>Next / previous card</td></tr>
+    <tr><td><kbd>g</kbd> / <kbd>G</kbd></td><td>First / last card</td></tr>
+    <tr><td><kbd>f</kbd></td><td>Filter: to do, all, dream fit, yes, maybe, follow, no, content ideas, screenshot issues</td></tr>
+    <tr><td><kbd>o</kbd></td><td>Open the website or posting (a search if the dossier has no link)</td></tr>
+    <tr><td><kbd>e</kbd></td><td>Open the dossier in Zed</td></tr>
+    <tr><td><kbd>r</kbd></td><td>Rebuild and reload after new dossiers land</td></tr>
+    <tr><td><kbd>space</kbd></td><td>Scroll the card</td></tr>
+  </table>
+  <p>To do skips anything the AI screen failed. In role mode it also skips roles at companies you said no to, and puts roles at dream-fit companies first, then yes, maybe, unlabelled, and followed companies, newest first.</p>
+</dialog>
+<script type="module" src="{{ get_url(path='triage.js') }}"></script>
+{% endblock %}
