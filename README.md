@@ -1,4 +1,4 @@
-# role-matching
+# job-search
 
 A job search run with Claude Code: AI-researched company and role dossiers, keyboard triage, and one folder per application. Everything is markdown in git, and the commands print TSV.
 
@@ -7,8 +7,8 @@ Needs macOS, Python 3.11+, [Zola](https://www.getzola.org) 0.23 or later (`brew 
 ## Start
 
 ```bash
-git clone https://github.com/joelshet/role-matching-template.git role-matching
-cd role-matching
+git clone https://github.com/joelshet/job-search.git
+cd job-search
 git remote remove origin
 ```
 
